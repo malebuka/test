@@ -1,0 +1,2137 @@
+# %% imports
+
+from typing import TypedDict, Dict, Any, List
+from copy import deepcopy
+
+from langgraph.graph import StateGraph, START, END
+
+import requests
+import json
+import re
+import urllib3
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+LLAMA_BASE_URL = "https://ttt.loc/llama-cpp"
+
+# базовая classifier
+INTENT_MODEL_NAME = "gemma4-e2b-it"
+
+# SFT клиент
+CLIENT_MODEL_NAME = "client_gemma4_e2b_it_v1"
+
+VERIFY_SSL = False
+
+MAX_TURNS = 20
+
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
+
+
+# ============================================================
+# CLIENT DATA
+#
+# Это конкретная ситуация тренажёра.
+# Меняешь профиль клиента — движок не трогаешь.
+# ============================================================
+
+CLIENT_DATA = {
+
+    "full_name": "Петров Петр Петрович",
+
+    # целевой клиент / третье лицо
+    "is_target_client": True,
+
+    # если is_target_client=False
+    "knows_target_client": False,
+
+    # стартовое настроение
+    "initial_mood_score": -2,
+
+    "character": """
+Клиент скептически настроен.
+
+Он не любит давление, угрозы, грубость и шаблонные фразы.
+
+Если агент:
+- слушает клиента;
+- учитывает его ответы;
+- задаёт уместные вопросы;
+- спокойно объясняет последствия;
+- предлагает реалистичные варианты решения;
+то клиент постепенно становится более благосклонным.
+
+Если агент давит, повторяется, игнорирует ответы клиента
+или ведёт себя неуместно — отношение ухудшается.
+
+При явной грубости отношение сразу становится максимально негативным,
+и клиент сам может отвечать грубо.
+""",
+
+    "reason_for_nonpayment": """
+У клиента возникли финансовые трудности.
+Полностью погасить задолженность сейчас он не может.
+""",
+
+    "debt_amount": "15000 рублей",
+
+    "loan_type": "автокредит",
+
+    "overdue_days": "10 дней",
+
+    # какие решения этому клиенту реально доступны
+    "solutions": {
+
+        "payment_3_days": {
+            "available": False,
+            "accept_score": 4,
+            "description": (
+                "полностью погасить задолженность "
+                "в ближайшие три дня"
+            ),
+        },
+
+        "sources_help": {
+            "available": False,
+            "accept_score": 4,
+            "description": (
+                "найти средства через родственников, друзей "
+                "или другой источник"
+            ),
+        },
+
+        "partial_payment": {
+            "available": True,
+            "accept_score": 2,
+            "description": (
+                "внести частичную оплату задолженности"
+            ),
+        },
+
+        "restructuring": {
+            "available": True,
+            "accept_score": 3,
+            "description": (
+                "рассмотреть реструктуризацию"
+            ),
+        },
+
+        "vehicle_transfer": {
+            "available": True,
+            "accept_score": 4,
+            "description": (
+                "рассмотреть урегулирование "
+                "через передачу автомобиля"
+            ),
+        },
+    },
+}
+
+
+# ============================================================
+# INTENT DICTS
+# Они полностью отдельно от config
+# ============================================================
+
+
+hello_intent_dict = {
+
+    "identification": (
+        "если агент спрашивает, разговаривает ли он с нужным клиентом "
+        "или прямо уточняет личность"
+    ),
+
+    "privacy_violation": (
+        "если агент уже сообщает наличие задолженности, сумму долга, "
+        "просрочку или сведения о кредите до подтверждения личности"
+    ),
+
+    "other": (
+        "агент приветствует, представляется, сообщает о записи "
+        "или говорит что-то другое, но ещё не запрашивает личность"
+    ),
+}
+
+
+identification_intent_dict = {
+
+    "identity_confirmed": (
+        "если агент корректно уточняет личность и по сценарию "
+        "собеседник является нужным клиентом"
+    ),
+
+    "not_target": (
+        "если агент корректно уточняет личность, но по сценарию "
+        "трубку поднял другой человек"
+    ),
+
+    "privacy_violation": (
+        "если агент сообщает задолженность до подтверждения личности"
+    ),
+
+    "other": (
+        "если агент не получил подтверждение личности "
+        "и не задал подходящий вопрос"
+    ),
+}
+
+
+identity_relation_intent_dict = {
+
+    "knows_target": (
+        "если агент спрашивает, знает ли собеседник нужного клиента "
+        "и по сценарию собеседник его знает"
+    ),
+
+    "not_knows_target": (
+        "если агент спрашивает, знает ли собеседник нужного клиента "
+        "и по сценарию собеседник его не знает"
+    ),
+
+    "privacy_violation": (
+        "если агент сообщает третьему лицу причину звонка, "
+        "наличие задолженности или другую приватную информацию"
+    ),
+
+    "other": "любая другая реплика",
+}
+
+
+callback_intent_dict = {
+
+    "callback_request": (
+        "если агент просит передать нужному клиенту, "
+        "чтобы тот связался с банком"
+    ),
+
+    "privacy_violation": (
+        "если агент сообщает третьему лицу сведения о задолженности"
+    ),
+
+    "other": "другая реплика",
+}
+
+
+debt_intent_dict = {
+
+    "asked_reason": (
+        "если агент спрашивает причину неоплаты"
+    ),
+
+    "asked_payment": (
+        "если агент спрашивает, когда клиент сможет оплатить"
+    ),
+
+    "offer:payment_3_days": (
+        "если агент предлагает полностью погасить задолженность "
+        "в ближайшие три дня"
+    ),
+
+    "offer:sources_help": (
+        "если агент предлагает найти деньги у родственников, друзей, "
+        "занять средства или найти другой источник денег"
+    ),
+
+    "offer:partial_payment": (
+        "если агент предлагает внести часть задолженности"
+    ),
+
+    "offer:restructuring": (
+        "если агент предлагает реструктуризацию"
+    ),
+
+    "offer:vehicle_transfer": (
+        "если агент предлагает вариант урегулирования "
+        "через передачу автомобиля"
+    ),
+
+    "other": "любая другая реплика",
+}
+
+
+persuasion_intent_dict = {
+
+    "offer:payment_3_days": (
+        "агент предлагает полностью погасить задолженность "
+        "в ближайшие три дня"
+    ),
+
+    "offer:sources_help": (
+        "агент предлагает помощь родственников, друзей, "
+        "занять средства или другой источник денег"
+    ),
+
+    "offer:partial_payment": (
+        "агент предлагает частичную оплату"
+    ),
+
+    "offer:restructuring": (
+        "агент предлагает реструктуризацию"
+    ),
+
+    "offer:vehicle_transfer": (
+        "агент предлагает урегулирование через передачу автомобиля"
+    ),
+
+    "good_persuasion": (
+        "агент хорошо работает с возражением: слушает клиента, "
+        "учитывает его слова, спокойно аргументирует, "
+        "объясняет выгоды или последствия без давления"
+    ),
+
+    "pressure": (
+        "агент давит, запугивает, манипулирует, "
+        "игнорирует слова клиента или чрезмерно настаивает"
+    ),
+
+    "rude": (
+        "агент явно хамит, унижает или оскорбляет клиента"
+    ),
+
+    "question": (
+        "агент задаёт уместный вопрос, чтобы лучше понять "
+        "ситуацию клиента"
+    ),
+
+    "other": "другая реплика",
+}
+
+
+agreement_intent_dict = {
+
+    "summarize": (
+        "если агент правильно подводит итог договорённости "
+        "и фиксирует выбранное решение"
+    ),
+
+    "goodbye": (
+        "если агент завершает разговор и прощается"
+    ),
+
+    "other": "другая реплика",
+}
+
+
+goodbye_intent_dict = {
+
+    "goodbye": (
+        "если агент корректно завершает разговор"
+    ),
+
+    "other": "другая реплика",
+}
+
+
+# ============================================================
+# CONFIG
+#
+# Внутри каждого stage ТОЛЬКО:
+# instruction
+# intent_dict
+# next
+# ============================================================
+
+config = {
+
+    "stages": {
+
+        # ----------------------------------------------------
+        # 1. Начало
+        # ----------------------------------------------------
+
+        "hello": {
+
+            "instruction": """
+Ты только что поднял трубку.
+
+Ты обычный человек, а пользователь играет банковского агента.
+
+Не помогай агенту пройти сценарий.
+Не напоминай ему, что он должен представиться.
+Не напоминай про запись разговора.
+Не называй своё имя самостоятельно.
+
+Если агент просто здоровается или представляется —
+ответь естественно и коротко.
+
+Не подтверждай личность,
+пока агент прямо не спросил, разговаривает ли он
+с нужным человеком.
+
+Если агент раскрывает задолженность до подтверждения личности,
+возмутись.
+""",
+
+            "intent_dict": hello_intent_dict,
+
+            "next": {
+                "identification": "identification",
+                "privacy_violation": "goodbye",
+                "else": "hello",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 2. Identification
+        # ----------------------------------------------------
+
+        "identification": {
+
+            "instruction": """
+Агент должен установить твою личность.
+
+Если агент прямо спрашивает,
+являешься ли ты нужным клиентом:
+
+- если is_target_client=True,
+  подтверди личность коротко и естественно;
+
+- если is_target_client=False,
+  скажи, что это не ты.
+
+Не сообщай агенту заранее,
+являешься ли ты нужным человеком.
+
+До подтверждения личности
+не обсуждай задолженность.
+""",
+
+            "intent_dict": identification_intent_dict,
+
+            "next": {
+                "identity_confirmed": "debt",
+                "not_target": "identity_relation",
+                "privacy_violation": "goodbye",
+                "else": "identification",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 3. Third party
+        # ----------------------------------------------------
+
+        "identity_relation": {
+
+            "instruction": """
+Ты не являешься человеком,
+которого ищет агент.
+
+Если агент спрашивает,
+знаешь ли ты нужного человека,
+ответь согласно скрытому сценарию.
+
+Никогда не обсуждай задолженность другого человека.
+
+Если агент раскрывает тебе сведения о долге,
+отреагируй негативно.
+""",
+
+            "intent_dict": identity_relation_intent_dict,
+
+            "next": {
+                "knows_target": "ask_relative_to_callback",
+                "not_knows_target": "goodbye",
+                "privacy_violation": "goodbye",
+                "else": "identity_relation",
+            },
+        },
+
+        "ask_relative_to_callback": {
+
+            "instruction": """
+Ты знаешь человека, которого ищет банк.
+
+Агент может попросить тебя передать ему,
+чтобы он связался с банком.
+
+Если агент делает это корректно,
+скажи, что передашь информацию.
+
+Не проси объяснять причину звонка.
+Не обсуждай чужую задолженность.
+""",
+
+            "intent_dict": callback_intent_dict,
+
+            "next": {
+                "callback_request": "goodbye",
+                "privacy_violation": "goodbye",
+                "else": "ask_relative_to_callback",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 4. Debt
+        # ----------------------------------------------------
+
+        "debt": {
+
+            "instruction": f"""
+Твоя личность подтверждена.
+Теперь агент может обсуждать задолженность.
+
+Твои данные:
+
+Сумма задолженности:
+{CLIENT_DATA["debt_amount"]}
+
+Тип кредита:
+{CLIENT_DATA["loan_type"]}
+
+Срок просрочки:
+{CLIENT_DATA["overdue_days"]}
+
+Причина неоплаты:
+{CLIENT_DATA["reason_for_nonpayment"]}
+
+Не соглашайся автоматически платить.
+
+Если агент спрашивает причину неоплаты —
+расскажи её естественно.
+
+Если спрашивает,
+когда сможешь оплатить —
+отвечай согласно своей ситуации.
+
+Твоё отношение к агенту определяется mood_score.
+Не называй эту цифру вслух.
+""",
+
+            "intent_dict": debt_intent_dict,
+
+            "next": {
+                "asked_reason": "persuasion",
+                "asked_payment": "persuasion",
+
+                "offer:payment_3_days": "persuasion",
+                "offer:sources_help": "persuasion",
+                "offer:partial_payment": "persuasion",
+                "offer:restructuring": "persuasion",
+                "offer:vehicle_transfer": "persuasion",
+
+                "else": "debt",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 5. Persuasion
+        # ----------------------------------------------------
+
+        "persuasion": {
+
+            "instruction": """
+Ты находишься на этапе переговоров.
+
+Твоё настроение определяется скрытым mood_score
+от -5 до +5.
+
+-5:
+максимально негативное состояние.
+Ты раздражён.
+При грубости агента можешь грубить в ответ.
+Не хочешь сотрудничать.
+
+-4 / -3:
+раздражён.
+Сопротивляешься предложениям,
+можешь отвечать резко.
+
+-2 / -1:
+скептически настроен.
+Сомневаешься и не готов быстро соглашаться.
+
+0:
+нейтральное отношение.
+
++1 / +2:
+начинаешь прислушиваться.
+Готов обсуждать варианты.
+
++3 / +4:
+агент вызывает доверие.
+Готов искать реальный компромисс.
+
++5:
+максимально благосклонен.
+Готов договариваться.
+
+ВАЖНО:
+
+Не называй mood_score.
+
+Не соглашайся на решение,
+которое объективно недоступно тебе по сценарию.
+
+Не соглашайся просто потому,
+что агент повторил одно и то же предложение.
+
+Если агент хорошо убеждает,
+твой mood_score будет постепенно расти.
+
+Если агент давит —
+снижаться.
+
+Если агент грубит —
+становится -5.
+
+Если chosen_solution уже установлен,
+значит ты действительно согласился
+на конкретный вариант.
+""",
+
+            "intent_dict": persuasion_intent_dict,
+
+            "next": {
+                "agreement": "agreement",
+
+                "offer:payment_3_days": "persuasion",
+                "offer:sources_help": "persuasion",
+                "offer:partial_payment": "persuasion",
+                "offer:restructuring": "persuasion",
+                "offer:vehicle_transfer": "persuasion",
+
+                "good_persuasion": "persuasion",
+                "pressure": "persuasion",
+                "rude": "persuasion",
+                "question": "persuasion",
+
+                "else": "persuasion",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 6. Agreement
+        # ----------------------------------------------------
+
+        "agreement": {
+
+            "instruction": """
+Ты уже согласился на конкретный вариант урегулирования.
+
+Не меняй решение без причины.
+
+Ожидай,
+что агент кратко подведёт итог договорённости.
+
+Если он правильно называет договорённость —
+подтверди её.
+
+Если он ошибается —
+поправь его.
+
+Не помогай ему формулировать итог.
+""",
+
+            "intent_dict": agreement_intent_dict,
+
+            "next": {
+                "summarize": "goodbye",
+                "goodbye": "final_score",
+                "else": "agreement",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 7. Goodbye
+        # ----------------------------------------------------
+
+        "goodbye": {
+
+            "instruction": """
+Разговор подходит к концу.
+
+Отвечай естественно и коротко.
+
+Если агент корректно прощается —
+попрощайся в ответ.
+""",
+
+            "intent_dict": goodbye_intent_dict,
+
+            "next": {
+                "goodbye": "final_score",
+                "else": "goodbye",
+            },
+        },
+
+        # ----------------------------------------------------
+        # 8. Технический финальный stage
+        # ----------------------------------------------------
+
+        "final_score": {
+
+            "instruction": """
+Оцени весь завершённый разговор агента.
+""",
+
+            "intent_dict": None,
+
+            "next": {
+                "else": ""
+            },
+        },
+    }
+}
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+class DialogState(TypedDict, total=False):
+
+    stage: str
+    next_stage: str
+
+    user_message: str
+    assistant_message: str
+
+    intent: str
+    instruction: str
+
+    mood_score: int
+
+    turn_num: int
+
+    identity_confirmed: bool
+
+    introduced: bool
+    bank_named: bool
+    recording_notice: bool
+
+    privacy_violation: bool
+
+    asked_reason: bool
+    asked_payment: bool
+
+    summarized: bool
+    goodbye: bool
+
+    chosen_solution: str
+
+    history: List[Dict[str, str]]
+
+    final_report: Dict[str, Any]
+
+
+# ============================================================
+# LLAMA CPP SERVER
+# ============================================================
+
+class LlamaCppServerClient:
+
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str,
+        verify_ssl: bool = False
+    ):
+
+        self.base_url = base_url.rstrip("/")
+        self.model_name = model_name
+        self.verify_ssl = verify_ssl
+
+    def chat(
+        self,
+        messages,
+        temperature=0.3,
+        num_predict=220,
+        top_p=0.9,
+        top_k=50,
+        min_p=0.01,
+        repeat_penalty=1.15,
+        stop=None,
+    ):
+
+        if stop is None:
+            stop = [
+                "<|im_end|>",
+                "<|endoftext|>"
+            ]
+
+        payload = {
+
+            "model": self.model_name,
+
+            "messages": messages,
+
+            "temperature": temperature,
+
+            "max_tokens": num_predict,
+
+            "top_p": top_p,
+
+            "top_k": top_k,
+
+            "min_p": min_p,
+
+            "repeat_penalty": repeat_penalty,
+
+            "stop": stop,
+        }
+
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=300,
+            verify=self.verify_ssl,
+        )
+
+        response.raise_for_status()
+
+        return (
+            response
+            .json()["choices"][0]["message"]["content"]
+        )
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+client_llm = LlamaCppServerClient(
+    base_url=LLAMA_BASE_URL,
+    model_name=CLIENT_MODEL_NAME,
+    verify_ssl=VERIFY_SSL
+)
+
+intent_llm = LlamaCppServerClient(
+    base_url=LLAMA_BASE_URL,
+    model_name=INTENT_MODEL_NAME,
+    verify_ssl=VERIFY_SSL
+)
+
+
+# ============================================================
+# JSON
+# ============================================================
+
+def safe_json(text: str):
+
+    text = text.strip()
+
+    text = re.sub(
+        r"^```(?:json)?",
+        "",
+        text,
+        flags=re.I
+    )
+
+    text = re.sub(
+        r"```$",
+        "",
+        text
+    )
+
+    return json.loads(text.strip())
+
+
+# ============================================================
+# INTENT PROMPT
+# ============================================================
+
+def build_intent_prompt(
+    stage_name: str,
+    agent_message: str,
+    intents: str,
+    intent_rules: str,
+    state: DialogState,
+) -> str:
+
+    return f"""
+Ты классификатор реплики банковского агента
+в тренажёре переговоров.
+
+Пользователь играет банковского агента.
+Модель играет клиента.
+
+Текущий stage:
+{stage_name}
+
+Реплика агента:
+{agent_message}
+
+Текущий mood_score:
+{state.get("mood_score", 0)}
+
+Клиент является целевым:
+{CLIENT_DATA["is_target_client"]}
+
+Если это третье лицо,
+оно знает нужного клиента:
+{CLIENT_DATA["knows_target_client"]}
+
+Личность уже подтверждена:
+{state.get("identity_confirmed", False)}
+
+Характер клиента:
+{CLIENT_DATA["character"]}
+
+Возможные intent:
+
+{intents}
+
+Правила классификации:
+
+{intent_rules}
+
+
+Верни ТОЛЬКО JSON:
+
+{{
+    "intent": "один из допустимых intent",
+
+    "reaction": "liked | neutral | disliked | rude",
+
+    "new_mood_score": 0,
+
+    "introduced": false,
+
+    "bank_named": false,
+
+    "recording_notice": false,
+
+    "disclosed_debt": false,
+
+    "asked_reason": false,
+
+    "asked_payment": false,
+
+    "summarized": false,
+
+    "goodbye": false,
+
+    "short_reason": "короткое объяснение"
+}}
+
+
+КАК СЧИТАТЬ new_mood_score:
+
+Текущий score:
+{state.get("mood_score", 0)}
+
+Если реплика понравилась конкретному клиенту:
+reaction = liked
+new_mood_score = текущий score + 1.
+
+Если реплика не понравилась:
+reaction = disliked
+new_mood_score = текущий score - 1.
+
+Если обычная процедурная нейтральная реплика:
+reaction = neutral
+score не меняется.
+
+Если агент явно грубит или оскорбляет:
+reaction = rude
+new_mood_score = -5.
+
+Score всегда должен быть от -5 до +5.
+
+
+liked ставь, если агент:
+
+- действительно слушает клиента;
+- учитывает его предыдущий ответ;
+- хорошо работает с возражением;
+- спокойно и убедительно аргументирует;
+- предлагает подходящее решение;
+- говорит уважительно.
+
+
+disliked ставь, если агент:
+
+- оказывает ненужное давление;
+- игнорирует слова клиента;
+- бессмысленно повторяется;
+- говорит шаблонно и неуместно;
+- плохо работает с возражением;
+- спорит вместо диалога.
+
+
+ВАЖНО:
+
+Приветствие,
+представление,
+сообщение о записи,
+обычная идентификация
+сами по себе являются neutral,
+а не liked.
+
+
+introduced=true,
+если агент представился.
+
+bank_named=true,
+если назвал банк или организацию.
+
+recording_notice=true,
+если сообщил,
+что разговор записывается.
+
+
+disclosed_debt=true,
+если агент сообщил:
+
+- наличие задолженности;
+- сумму задолженности;
+- срок просрочки;
+- сведения о кредите;
+- другую приватную информацию о долге.
+
+
+Если disclosed_debt=true,
+но identity_confirmed=false,
+это нарушение конфиденциальности.
+
+
+Если агент в одной реплике одновременно спрашивает:
+
+"Петров Петр Петрович, это вы?"
+
+и сразу после этого раскрывает долг,
+
+личность на момент раскрытия
+ЕЩЁ НЕ подтверждена.
+
+
+Не завышай reaction.
+Оценивай строго.
+""".strip()
+
+
+# ============================================================
+# GET INTENT
+# ============================================================
+
+def get_intent(intent_prompt: str) -> Dict[str, Any]:
+
+    try:
+
+        response = intent_llm.chat(
+
+            messages=[
+
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты строгий классификатор. "
+                        "Возвращай только JSON без markdown."
+                    ),
+                },
+
+                {
+                    "role": "user",
+                    "content": intent_prompt,
+                },
+            ],
+
+            temperature=0.0,
+
+            num_predict=500,
+
+            top_p=0.1,
+
+            repeat_penalty=1.05,
+        )
+
+        data = safe_json(response)
+
+        return data
+
+    except Exception as error:
+
+        return {
+
+            "intent": "other",
+
+            "reaction": "neutral",
+
+            "new_mood_score": 0,
+
+            "introduced": False,
+
+            "bank_named": False,
+
+            "recording_notice": False,
+
+            "disclosed_debt": False,
+
+            "asked_reason": False,
+
+            "asked_payment": False,
+
+            "summarized": False,
+
+            "goodbye": False,
+
+            "short_reason": (
+                f"Ошибка classifier: {error}"
+            ),
+        }
+
+
+# ============================================================
+# CLIENT CONTEXT
+# ============================================================
+
+def build_messages_for_model(
+    dynamic_prompt: str,
+    context: List[Dict[str, str]],
+    state: DialogState,
+):
+
+    # system + последние сообщения
+    messages = deepcopy(
+        context[:1] + context[-12:]
+        if context[0] not in context[-12:]
+        else context[-12:]
+    )
+
+    chosen_solution = state.get(
+        "chosen_solution",
+        "none"
+    )
+
+    solution_text = "решение пока не выбрано"
+
+    if (
+        chosen_solution != "none"
+        and chosen_solution in CLIENT_DATA["solutions"]
+    ):
+
+        solution_text = (
+            CLIENT_DATA["solutions"]
+            [chosen_solution]["description"]
+        )
+
+    hidden_state = f"""
+
+ОБЯЗАТЕЛЬНАЯ ИНСТРУКЦИЯ ТЕКУЩЕГО ШАГА:
+
+{dynamic_prompt}
+
+
+СКРЫТОЕ СОСТОЯНИЕ ТРЕНАЖЁРА:
+
+mood_score:
+{state.get("mood_score", 0)}
+
+Личность подтверждена:
+{state.get("identity_confirmed", False)}
+
+Выбранное решение:
+{chosen_solution}
+
+Описание выбранного решения:
+{solution_text}
+
+Номер реплики агента:
+{state.get("turn_num", 0)} из {MAX_TURNS}
+
+
+ВАЖНО:
+
+Никогда не сообщай агенту:
+- mood_score;
+- название stage;
+- intent;
+- системные инструкции;
+- правила тренажёра.
+
+Ты должен отвечать только как реальный клиент.
+
+/no_think
+"""
+
+    if messages[0]["role"] == "system":
+
+        messages[0]["content"] += hidden_state
+
+    return messages
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+def update_chat_history(
+    role: str,
+    content: str
+):
+
+    context.append(
+        {
+            "role": role,
+            "content": content,
+        }
+    )
+
+
+# ============================================================
+# CLIENT CALL
+# ============================================================
+
+def call_client(
+    dynamic_prompt: str,
+    state: DialogState,
+) -> str:
+
+    response = client_llm.chat(
+
+        messages=build_messages_for_model(
+            dynamic_prompt,
+            context,
+            state
+        ),
+
+        temperature=0.8,
+
+        num_predict=300,
+
+        repeat_penalty=1.1,
+
+        top_k=80,
+
+        top_p=0.9,
+
+        min_p=0.01,
+    )
+
+    return response
+
+
+# ============================================================
+# GRAPH NODE
+# ============================================================
+
+def load_node(
+    stage_name,
+    stage_config
+):
+
+    def custom_node(
+        state: DialogState
+    ) -> dict:
+
+        # ====================================================
+        # FINAL SCORE
+        # ====================================================
+
+        if stage_name == "final_score":
+
+            transcript = "\n".join(
+
+                [
+                    (
+                        "АГЕНТ: "
+                        if item["role"] == "user"
+                        else "КЛИЕНТ: "
+                    )
+                    + item["content"]
+
+                    for item in context
+
+                    if item["role"] != "system"
+                ]
+            )
+
+            final_prompt = f"""
+Ты старший тренер банковских агентов.
+
+Перед тобой полный учебный разговор.
+
+Оцени ТОЛЬКО работу агента.
+
+
+ФАКТЫ STATE:
+
+Агент представился:
+{state.get("introduced", False)}
+
+Назвал банк:
+{state.get("bank_named", False)}
+
+Сообщил о записи:
+{state.get("recording_notice", False)}
+
+Личность подтверждена:
+{state.get("identity_confirmed", False)}
+
+Нарушение конфиденциальности:
+{state.get("privacy_violation", False)}
+
+Выяснил причину неоплаты:
+{state.get("asked_reason", False)}
+
+Спросил о возможности оплаты:
+{state.get("asked_payment", False)}
+
+Выбранное решение:
+{state.get("chosen_solution", "none")}
+
+Финальное отношение клиента:
+{state.get("mood_score", 0)}
+
+Количество реплик агента:
+{state.get("turn_num", 0)}
+
+
+Оцени агента по шкале 0-100.
+
+
+КРИТЕРИИ:
+
+1. Начало разговора — 15 баллов.
+
+Представился.
+Назвал банк.
+Предупредил о записи разговора.
+
+
+2. Идентификация и конфиденциальность — 20 баллов.
+
+Корректно подтвердил личность
+до раскрытия задолженности.
+
+Не раскрыл долг третьему лицу.
+
+
+3. Выявление ситуации — 15 баллов.
+
+Выяснил причину неоплаты.
+Слушал ответы клиента.
+Понял реальные возможности клиента.
+
+
+4. Переговоры — 25 баллов.
+
+Хорошо работал с возражениями.
+Предлагал подходящие варианты.
+Не повторялся.
+Не давил.
+Получил конкретную договорённость.
+
+
+5. Коммуникация — 15 баллов.
+
+Уважительный тон.
+Умение слушать.
+Качественная аргументация.
+Адаптация к клиенту.
+
+
+6. Завершение — 10 баллов.
+
+Подвёл итог.
+Зафиксировал договорённость.
+Корректно закончил разговор.
+
+
+ОБЯЗАТЕЛЬНО ПОМЕТЬ ОШИБКИ:
+
+- не представился;
+- не назвал банк;
+- не сообщил о записи разговора;
+- не проверил личность;
+- раскрыл долг до идентификации;
+- раскрыл долг третьему лицу;
+- грубил;
+- чрезмерно давил;
+- не слушал клиента;
+- бессмысленно повторялся;
+- не подвёл итог договорённости.
+
+
+Если privacy_violation=True —
+это CRITICAL ошибка
+и итоговый балл должен сильно снижаться.
+
+
+Наличие договорённости само по себе
+не отменяет остальные ошибки.
+
+
+Верни ТОЛЬКО JSON:
+
+{{
+    "score": 0,
+
+    "result": "excellent | good | needs_improvement | failed",
+
+    "strengths": [
+        "сильная сторона"
+    ],
+
+    "errors": [
+        {{
+            "severity": "minor | major | critical",
+            "message": "описание ошибки"
+        }}
+    ],
+
+    "recommendations": [
+        "конкретная рекомендация"
+    ],
+
+    "summary": "короткий итог работы агента"
+}}
+
+
+Градация:
+
+90-100 = excellent
+75-89 = good
+55-74 = needs_improvement
+0-54 = failed
+
+
+ДИАЛОГ:
+
+{transcript}
+""".strip()
+
+            response = intent_llm.chat(
+
+                messages=[
+
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты строгий тренер "
+                            "банковского контактного центра. "
+                            "Верни только JSON."
+                        ),
+                    },
+
+                    {
+                        "role": "user",
+                        "content": final_prompt,
+                    },
+                ],
+
+                temperature=0.0,
+
+                num_predict=1500,
+
+                top_p=0.1,
+            )
+
+            try:
+                final_report = safe_json(response)
+
+            except Exception as error:
+
+                final_report = {
+
+                    "score": 0,
+
+                    "result": "failed",
+
+                    "strengths": [],
+
+                    "errors": [
+                        {
+                            "severity": "critical",
+                            "message": (
+                                f"Ошибка финальной оценки: {error}"
+                            ),
+                        }
+                    ],
+
+                    "recommendations": [],
+
+                    "summary": "",
+                }
+
+            print("\n")
+            print("=" * 70)
+            print("РЕЗУЛЬТАТ ТРЕНАЖЁРА")
+            print("=" * 70)
+
+            print(
+                f"\nИТОГОВЫЙ БАЛЛ: "
+                f"{final_report.get('score', 0)} / 100"
+            )
+
+            print(
+                f"РЕЗУЛЬТАТ: "
+                f"{final_report.get('result')}"
+            )
+
+            print(
+                f"MOOD КЛИЕНТА: "
+                f"{state.get('mood_score', 0)}"
+            )
+
+            print(
+                f"ВЫБРАННОЕ РЕШЕНИЕ: "
+                f"{state.get('chosen_solution', 'none')}"
+            )
+
+            print("\nСИЛЬНЫЕ СТОРОНЫ:")
+
+            for item in final_report.get(
+                "strengths",
+                []
+            ):
+                print(f"+ {item}")
+
+            print("\nОШИБКИ:")
+
+            for error in final_report.get(
+                "errors",
+                []
+            ):
+
+                print(
+                    f"[{error.get('severity', '').upper()}] "
+                    f"{error.get('message', '')}"
+                )
+
+            print("\nРЕКОМЕНДАЦИИ:")
+
+            for item in final_report.get(
+                "recommendations",
+                []
+            ):
+                print(f"- {item}")
+
+            print("\nИТОГ:")
+            print(
+                final_report.get(
+                    "summary",
+                    ""
+                )
+            )
+
+            return {
+                **state,
+
+                "stage": stage_name,
+
+                "next_stage": END,
+
+                "final_report": final_report,
+            }
+
+        # ====================================================
+        # NORMAL CLIENT NODE
+        # ====================================================
+
+        turn_num = (
+            state.get("turn_num", 0) + 1
+        )
+
+        mood_score = state.get(
+            "mood_score",
+            CLIENT_DATA["initial_mood_score"]
+        )
+
+        # ----------------------------------------------------
+        # AGENT TURN
+        # ----------------------------------------------------
+
+        agent_message = input(
+            "\nАГЕНТ: "
+        ).strip()
+
+        update_chat_history(
+            "user",
+            agent_message
+        )
+
+        # ----------------------------------------------------
+        # INTENT
+        # ----------------------------------------------------
+
+        intent = None
+        intent_data = {}
+
+        intent_dict = stage_config[
+            "intent_dict"
+        ]
+
+        if intent_dict:
+
+            intents = " | ".join(
+                intent_dict.keys()
+            )
+
+            intent_rules = "\n".join(
+
+                [
+                    (
+                        str(i)
+                        + ". intent = "
+                        + item
+                        + ", "
+                        + intent_dict[item]
+                    )
+
+                    for i, item
+                    in enumerate(
+                        intent_dict,
+                        start=1
+                    )
+                ]
+            )
+
+            intent_prompt = build_intent_prompt(
+
+                stage_name,
+
+                agent_message,
+
+                intents,
+
+                intent_rules,
+
+                state,
+            )
+
+            intent_data = get_intent(
+                intent_prompt
+            )
+
+            intent = intent_data.get(
+                "intent",
+                "other"
+            )
+
+        # ----------------------------------------------------
+        # FLAGS
+        # ----------------------------------------------------
+
+        introduced = (
+            state.get("introduced", False)
+            or intent_data.get(
+                "introduced",
+                False
+            )
+        )
+
+        bank_named = (
+            state.get("bank_named", False)
+            or intent_data.get(
+                "bank_named",
+                False
+            )
+        )
+
+        recording_notice = (
+            state.get(
+                "recording_notice",
+                False
+            )
+            or intent_data.get(
+                "recording_notice",
+                False
+            )
+        )
+
+        asked_reason = (
+            state.get(
+                "asked_reason",
+                False
+            )
+            or intent_data.get(
+                "asked_reason",
+                False
+            )
+        )
+
+        asked_payment = (
+            state.get(
+                "asked_payment",
+                False
+            )
+            or intent_data.get(
+                "asked_payment",
+                False
+            )
+        )
+
+        summarized = (
+            state.get(
+                "summarized",
+                False
+            )
+            or intent_data.get(
+                "summarized",
+                False
+            )
+        )
+
+        goodbye = (
+            state.get(
+                "goodbye",
+                False
+            )
+            or intent_data.get(
+                "goodbye",
+                False
+            )
+        )
+
+        # ----------------------------------------------------
+        # MOOD SCORE
+        #
+        # Сам score считает classifier.
+        # ----------------------------------------------------
+
+        try:
+
+            mood_score = int(
+                intent_data.get(
+                    "new_mood_score",
+                    mood_score
+                )
+            )
+
+        except Exception:
+            pass
+
+        mood_score = max(
+            -5,
+            min(
+                5,
+                mood_score
+            )
+        )
+
+        # ----------------------------------------------------
+        # IDENTITY
+        # ----------------------------------------------------
+
+        identity_confirmed = state.get(
+            "identity_confirmed",
+            False
+        )
+
+        if intent == "identity_confirmed":
+
+            if CLIENT_DATA["is_target_client"]:
+                identity_confirmed = True
+
+        # ----------------------------------------------------
+        # PRIVACY
+        # ----------------------------------------------------
+
+        privacy_violation = state.get(
+            "privacy_violation",
+            False
+        )
+
+        if (
+            intent_data.get(
+                "disclosed_debt",
+                False
+            )
+            and not identity_confirmed
+        ):
+
+            privacy_violation = True
+
+            intent = "privacy_violation"
+
+            mood_score = -5
+
+        # ----------------------------------------------------
+        # SOLUTION
+        # ----------------------------------------------------
+
+        chosen_solution = state.get(
+            "chosen_solution",
+            "none"
+        )
+
+        if (
+            isinstance(intent, str)
+            and intent.startswith("offer:")
+        ):
+
+            solution = intent.split(
+                ":",
+                1
+            )[1]
+
+            solution_data = (
+                CLIENT_DATA[
+                    "solutions"
+                ].get(solution)
+            )
+
+            if solution_data:
+
+                available = (
+                    solution_data[
+                        "available"
+                    ]
+                )
+
+                accept_score = (
+                    solution_data[
+                        "accept_score"
+                    ]
+                )
+
+                if (
+                    available
+                    and mood_score
+                    >= accept_score
+                ):
+
+                    chosen_solution = solution
+
+                    # технический intent
+                    # для routing из config
+                    intent = "agreement"
+
+        # ----------------------------------------------------
+        # ROUTING
+        # ----------------------------------------------------
+
+        next_stage = stage_config[
+            "next"
+        ].get(
+
+            intent,
+
+            stage_config[
+                "next"
+            ].get(
+                "else",
+                stage_name
+            )
+        )
+
+        # ----------------------------------------------------
+        # TURN LIMIT
+        # ----------------------------------------------------
+
+        if turn_num >= MAX_TURNS:
+
+            next_stage = "final_score"
+
+        # ----------------------------------------------------
+        # TEMP STATE FOR CLIENT GENERATION
+        # ----------------------------------------------------
+
+        new_state = {
+
+            **state,
+
+            "stage": stage_name,
+
+            "next_stage": next_stage,
+
+            "user_message": agent_message,
+
+            "intent": intent,
+
+            "instruction": (
+                stage_config["instruction"]
+            ),
+
+            "turn_num": turn_num,
+
+            "mood_score": mood_score,
+
+            "introduced": introduced,
+
+            "bank_named": bank_named,
+
+            "recording_notice":
+                recording_notice,
+
+            "identity_confirmed":
+                identity_confirmed,
+
+            "privacy_violation":
+                privacy_violation,
+
+            "asked_reason":
+                asked_reason,
+
+            "asked_payment":
+                asked_payment,
+
+            "summarized":
+                summarized,
+
+            "goodbye":
+                goodbye,
+
+            "chosen_solution":
+                chosen_solution,
+        }
+
+        # ----------------------------------------------------
+        # CLIENT GENERATION
+        # ----------------------------------------------------
+
+        dynamic_prompt = (
+            "Обязательная инструкция имеет "
+            "приоритет над историей диалога:\n"
+            + stage_config["instruction"]
+        )
+
+        if turn_num >= MAX_TURNS:
+
+            dynamic_prompt += """
+
+Это двадцатая реплика агента.
+
+Независимо от предыдущего разговора
+скажи, что у тебя больше нет времени,
+заверши разговор и положи трубку.
+"""
+
+        client_message = call_client(
+            dynamic_prompt,
+            new_state
+        )
+
+        update_chat_history(
+            "assistant",
+            client_message
+        )
+
+        print(
+            f"\nКЛИЕНТ: "
+            f"{client_message}"
+        )
+
+        print(
+            "\n[DEBUG]"
+            f" stage={stage_name}"
+            f" | intent={intent}"
+            f" | mood={mood_score}"
+            f" | solution={chosen_solution}"
+            f" | next={next_stage}"
+            f" | reason={intent_data.get('short_reason', '')}"
+        )
+
+        return {
+
+            **new_state,
+
+            "assistant_message":
+                client_message,
+        }
+
+    return custom_node
+
+
+# ============================================================
+# ROUTING
+# ============================================================
+
+def route_to_next_stage(
+    state: DialogState
+):
+
+    print(
+        "\nSTATE:",
+        {
+            "stage":
+                state.get("stage"),
+
+            "next_stage":
+                state.get("next_stage"),
+
+            "mood_score":
+                state.get("mood_score"),
+
+            "intent":
+                state.get("intent"),
+
+            "chosen_solution":
+                state.get(
+                    "chosen_solution"
+                ),
+        }
+    )
+
+    return state.get(
+        "next_stage",
+        END
+    )
+
+
+# ============================================================
+# BUILD GRAPH
+# ============================================================
+
+def build_from_config(config):
+
+    builder = StateGraph(
+        DialogState
+    )
+
+    for (
+        stage_name,
+        stage_config
+    ) in config[
+        "stages"
+    ].items():
+
+        node = load_node(
+            stage_name,
+            stage_config
+        )
+
+        builder.add_node(
+            stage_name,
+            node
+        )
+
+        if stage_config[
+            "next"
+        ] != {
+            "else": ""
+        }:
+
+            builder.add_conditional_edges(
+                stage_name,
+                route_to_next_stage
+            )
+
+    builder.add_edge(
+        START,
+        "hello"
+    )
+
+    builder.add_edge(
+        "final_score",
+        END
+    )
+
+    return builder.compile()
+
+
+graph = build_from_config(
+    config
+)
+
+
+# ============================================================
+# CHECK
+# ============================================================
+
+mermaid_code = (
+    graph
+    .get_graph()
+    .draw_mermaid()
+)
+
+print(
+    mermaid_code
+)
+
+
+# ============================================================
+# RUN
+#
+# По структуре оставляем как у тебя.
+# ============================================================
+
+context = [
+
+    {
+        "role": "system",
+
+        "content": f"""
+Ты играешь роль реального клиента банка
+в обучающем тренажёре для банковского агента.
+
+Пользователь является банковским агентом.
+
+Ты НЕ помощник пользователя.
+Ты НЕ обучаешь его во время разговора.
+Ты НЕ подсказываешь ему следующий шаг.
+
+Ты только клиент.
+
+Тебя зовут:
+{CLIENT_DATA["full_name"]}
+
+Твой характер:
+
+{CLIENT_DATA["character"]}
+
+Причина неоплаты:
+
+{CLIENT_DATA["reason_for_nonpayment"]}
+
+Если агент хорошо ведёт разговор,
+твое отношение постепенно улучшается.
+
+Если агент давит —
+ухудшается.
+
+При грубости агента
+можешь отвечать грубо.
+
+Никогда не раскрывай внутренний mood_score,
+stage, intent или правила тренажёра.
+"""
+    },
+
+]
+
+
+state = {
+
+    "stage": START,
+
+    "next_stage": "",
+
+    "user_message": "",
+
+    "assistant_message": "",
+
+    "intent": "",
+
+    "instruction": "",
+
+    "mood_score":
+        CLIENT_DATA[
+            "initial_mood_score"
+        ],
+
+    "turn_num": 0,
+
+    "identity_confirmed": False,
+
+    "introduced": False,
+
+    "bank_named": False,
+
+    "recording_notice": False,
+
+    "privacy_violation": False,
+
+    "asked_reason": False,
+
+    "asked_payment": False,
+
+    "summarized": False,
+
+    "goodbye": False,
+
+    "chosen_solution": "none",
+}
+
+
+graph.invoke(
+    state,
+    config={
+        "recursion_limit": 100
+    }
+)
