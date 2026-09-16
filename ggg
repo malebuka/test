@@ -1,0 +1,456 @@
+import json
+import re
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+API_URL = "http://localhost:8000/v1/chat/completions"
+JUDGE_MODEL = "Qwen/Qwen3-8B"
+
+ALGORITHM_FILE = "algorithm.txt"
+
+OUTPUT_FILE = "algorithm_adherence_results.csv"
+
+
+# ============================================================
+# JUDGE PROMPT
+# ============================================================
+
+JUDGE_SYSTEM = """
+Ты независимый evaluator диалогового агента.
+
+Твоя задача — оценить, насколько агент соблюдает предоставленный
+алгоритм ведения диалога.
+
+ВАЖНО:
+- оценивай только наблюдаемое поведение агента;
+- не пытайся определить внутренние состояния, intents или ноды;
+- не оценивай красоту текста;
+- не оценивай стиль формулировок;
+- не оценивай длину ответа;
+- оценивай именно соблюдение алгоритма.
+
+Особенно важно проверить:
+
+1. Соблюдает ли агент установленную последовательность шагов.
+
+2. Не пропускает ли обязательные предложения или действия.
+
+3. Не переходит ли к следующему варианту слишком рано.
+
+4. Не повторяет ли вариант, который клиент уже явно отверг.
+
+5. Правильно ли интерпретирует ответы клиента.
+
+6. Не принимает ли обычное "да", "ага", "конечно" за согласие
+на конкретный вариант, если вопрос агента был о чем-то другом.
+
+7. Не считает ли агент клиента отказавшимся без явного отказа
+или явной невозможности варианта.
+
+8. После вопроса клиента, грубости или ухода от темы должен ли агент
+вернуться к основному алгоритму и действительно ли он это делает.
+
+9. Не завершает ли агент диалог раньше выполнения обязательных шагов.
+
+Поставь четыре оценки от 0 до 100:
+
+sequence_score:
+насколько правильно соблюдена последовательность действий.
+
+required_steps_score:
+насколько полно выполнены обязательные шаги алгоритма.
+
+transition_score:
+насколько корректно агент переходит от одного шага к следующему.
+
+context_score:
+насколько действия агента соответствуют ответам клиента
+и предыдущему контексту.
+
+Также укажи:
+
+critical_error:
+true, если в диалоге есть хотя бы одна критическая ошибка.
+
+critical_errors:
+список кратких описаний критических ошибок.
+
+К критическим ошибкам относятся:
+- ложное согласие клиента;
+- ложный отказ;
+- пропуск важного обязательного шага;
+- серьезное нарушение установленной последовательности;
+- переход к итоговому этапу раньше времени;
+- необоснованное завершение диалога;
+- действие, противоречащее явному ответу клиента.
+
+Верни ТОЛЬКО валидный JSON следующего вида:
+
+{
+  "sequence_score": 0,
+  "required_steps_score": 0,
+  "transition_score": 0,
+  "context_score": 0,
+  "critical_error": false,
+  "critical_errors": [],
+  "reason": "краткое объяснение оценки"
+}
+"""
+
+
+# ============================================================
+# FORMAT DIALOG
+# ============================================================
+
+def format_dialog(dialog):
+    """
+    dialog:
+    [
+        {"role": "assistant", "content": "..."},
+        {"role": "user", "content": "..."},
+        ...
+    ]
+    """
+
+    lines = []
+
+    for message in dialog:
+        role = message["role"]
+        content = message["content"]
+
+        if role == "assistant":
+            speaker = "AGENT"
+
+        elif role in ("user", "client"):
+            speaker = "CLIENT"
+
+        else:
+            # например system можно просто пропустить
+            continue
+
+        lines.append(
+            f"{speaker}: {content}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# JSON PARSER
+# ============================================================
+
+def extract_json(text):
+    text = text.strip()
+
+    # удаляем markdown fences
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
+
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+
+    except json.JSONDecodeError:
+        # fallback
+        match = re.search(
+            r"\{.*\}",
+            text,
+            flags=re.DOTALL,
+        )
+
+        if not match:
+            raise ValueError(
+                f"Judge returned invalid JSON:\n{text}"
+            )
+
+        return json.loads(
+            match.group(0)
+        )
+
+
+# ============================================================
+# JUDGE
+# ============================================================
+
+def call_judge(algorithm, dialog):
+    dialog_text = format_dialog(dialog)
+
+    user_prompt = f"""
+ЭТАЛОННЫЙ АЛГОРИТМ:
+
+========================
+{algorithm}
+========================
+
+ДИАЛОГ:
+
+========================
+{dialog_text}
+========================
+
+Оцени диалог целиком.
+
+Проверь особенно внимательно порядок обязательных предложений.
+Если алгоритм требует сначала предложить один вариант,
+а следующий предлагать только после отказа или невозможности предыдущего,
+учитывай это при оценке.
+
+Не снижай оценку только за формулировки.
+Оцени именно логику поведения агента.
+"""
+
+    payload = {
+        "model": JUDGE_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": JUDGE_SYSTEM,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 1000,
+    }
+
+    response = requests.post(
+        API_URL,
+        json=payload,
+        timeout=180,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    content = (
+        data["choices"][0]
+        ["message"]["content"]
+    )
+
+    return extract_json(content)
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+def calculate_total_score(result):
+    """
+    Среднее из четырех компонентов.
+    """
+
+    scores = [
+        result["sequence_score"],
+        result["required_steps_score"],
+        result["transition_score"],
+        result["context_score"],
+    ]
+
+    return sum(scores) / len(scores)
+
+
+# ============================================================
+# EVALUATE ONE SYSTEM
+# ============================================================
+
+def evaluate_system(
+    dialogs,
+    system_name,
+    algorithm,
+):
+    rows = []
+
+    for i, dialog in enumerate(dialogs, 1):
+
+        print(
+            f"[{system_name}] "
+            f"dialog {i}/{len(dialogs)}"
+        )
+
+        try:
+            result = call_judge(
+                algorithm=algorithm,
+                dialog=dialog,
+            )
+
+            total_score = calculate_total_score(
+                result
+            )
+
+            rows.append({
+                "system": system_name,
+                "dialog_id": i,
+
+                "algorithm_adherence":
+                    total_score,
+
+                "sequence_score":
+                    result["sequence_score"],
+
+                "required_steps_score":
+                    result["required_steps_score"],
+
+                "transition_score":
+                    result["transition_score"],
+
+                "context_score":
+                    result["context_score"],
+
+                "critical_error":
+                    int(result.get(
+                        "critical_error",
+                        False,
+                    )),
+
+                "critical_errors":
+                    " | ".join(
+                        result.get(
+                            "critical_errors",
+                            []
+                        )
+                    ),
+
+                "reason":
+                    result.get(
+                        "reason",
+                        ""
+                    ),
+            })
+
+        except Exception as e:
+            print(
+                f"ERROR in {system_name} "
+                f"dialog {i}: {e}"
+            )
+
+    return rows
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def evaluate_all(
+    graph_dialogs,
+    prompt_dialogs,
+):
+    algorithm = Path(
+        ALGORITHM_FILE
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    rows = []
+
+    rows += evaluate_system(
+        dialogs=graph_dialogs,
+        system_name="graph",
+        algorithm=algorithm,
+    )
+
+    rows += evaluate_system(
+        dialogs=prompt_dialogs,
+        system_name="prompt",
+        algorithm=algorithm,
+    )
+
+    df = pd.DataFrame(rows)
+
+    df.to_csv(
+        OUTPUT_FILE,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # ========================================================
+    # SYSTEM SUMMARY
+    # ========================================================
+
+    summary = (
+        df
+        .groupby("system")
+        .agg(
+            dialogs=(
+                "dialog_id",
+                "count",
+            ),
+
+            algorithm_adherence=(
+                "algorithm_adherence",
+                "mean",
+            ),
+
+            adherence_std=(
+                "algorithm_adherence",
+                "std",
+            ),
+
+            sequence_score=(
+                "sequence_score",
+                "mean",
+            ),
+
+            required_steps_score=(
+                "required_steps_score",
+                "mean",
+            ),
+
+            transition_score=(
+                "transition_score",
+                "mean",
+            ),
+
+            context_score=(
+                "context_score",
+                "mean",
+            ),
+
+            critical_error_rate=(
+                "critical_error",
+                "mean",
+            ),
+
+            critical_error_count=(
+                "critical_error",
+                "sum",
+            ),
+        )
+    )
+
+    summary[
+        "critical_error_rate"
+    ] *= 100
+
+    print()
+    print("=" * 80)
+    print("FINAL COMPARISON")
+    print("=" * 80)
+
+    print(
+        summary
+        .round(2)
+        .to_string()
+    )
+
+    return df, summary
