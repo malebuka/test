@@ -1,0 +1,120 @@
+def call_judge(algorithm, dialog):
+    dialog_text = format_dialog(dialog)
+
+    user_prompt = f"""
+ЭТАЛОННЫЙ АЛГОРИТМ:
+
+========================
+{algorithm}
+========================
+
+ДИАЛОГ:
+
+========================
+{dialog_text}
+========================
+
+Оцени, насколько агент соблюдает заданный алгоритм.
+
+Проверь:
+- правильность последовательности действий;
+- выполнение обязательных шагов;
+- отсутствие преждевременных переходов;
+- соответствие действий агента ответам клиента;
+- наличие критических ошибок.
+
+Верни ТОЛЬКО JSON следующего вида:
+
+{{
+  "sequence_score": 0,
+  "required_steps_score": 0,
+  "transition_score": 0,
+  "context_score": 0,
+  "critical_error": false,
+  "critical_errors": []
+}}
+
+Правила:
+- все оценки от 0 до 100;
+- critical_error: только true или false;
+- critical_errors: максимум 3 коротких пункта;
+- не добавляй объяснений;
+- не используй markdown;
+- никакого текста до или после JSON.
+"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": JUDGE_SYSTEM,
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
+
+    # Для Qwen3 можно отключить thinking.
+    try:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        # Если конкретный tokenizer не поддерживает enable_thinking
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+
+        # Максимум входного контекста.
+        # Можешь поставить 32768, если модель поддерживает.
+        max_length=32768,
+    )
+
+    # Отправляем на устройство, где лежит embedding модели
+    device = model.get_input_embeddings().weight.device
+
+    inputs = {
+        k: v.to(device)
+        for k, v in inputs.items()
+    }
+
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            **inputs,
+
+            # Это аналог num_predict в Ollama
+            max_new_tokens=512,
+
+            # Для evaluator лучше deterministic
+            do_sample=False,
+
+            # На случай предупреждений
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    # Нам нужен только НОВЫЙ текст,
+    # а не исходный prompt.
+    new_tokens = generated_ids[
+        0,
+        inputs["input_ids"].shape[1]:
+    ]
+
+    content = tokenizer.decode(
+        new_tokens,
+        skip_special_tokens=True,
+    ).strip()
+
+    print("RAW JUDGE OUTPUT:")
+    print(repr(content))
+
+    return extract_json(content)
