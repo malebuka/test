@@ -1,67 +1,741 @@
-from safetensors import safe_open
-
-ORIGINAL = "/path/to/original/model.safetensors"
-MERGED = "/path/to/my-merged/model.safetensors"
-
-
-def get_structure(path):
-    result = {}
-
-    with safe_open(path, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            tensor_slice = f.get_slice(key)
-            result[key] = tuple(tensor_slice.get_shape())
-
-    return result
+import json
+import re
+import requests
+import pandas as pd
 
 
-original = get_structure(ORIGINAL)
-merged = get_structure(MERGED)
+# ============================================================
+# CONFIG
+# ============================================================
 
-original_keys = set(original)
-merged_keys = set(merged)
+OLLAMA_URL = "http://localhost:11434/api/chat"
 
-missing = sorted(original_keys - merged_keys)
-extra = sorted(merged_keys - original_keys)
+JUDGE_MODEL = "qwen3:8b"
 
-different_shapes = sorted(
-    key
-    for key in original_keys & merged_keys
-    if original[key] != merged[key]
-)
+NUM_CTX = 32768
+NUM_PREDICT = 800
 
-print("Количество тензоров:")
-print("  original:", len(original))
-print("  merged:  ", len(merged))
+OUTPUT_TURNS = "generation_quality_turns.csv"
+OUTPUT_DIALOGS = "generation_quality_dialogs.csv"
 
-print("\nОтсутствуют в merged:")
-if missing:
-    for key in missing:
-        print(f"- {key} {original[key]}")
-else:
-    print("Нет")
 
-print("\nЛишние в merged:")
-if extra:
-    for key in extra:
-        print(f"+ {key} {merged[key]}")
-else:
-    print("Нет")
+# ============================================================
+# КАТЕГОРИИ ОШИБОК
+# ============================================================
 
-print("\nРазличаются размеры:")
-if different_shapes:
-    for key in different_shapes:
-        print(f"{key}: original={original[key]}, merged={merged[key]}")
-else:
-    print("Нет")
-
-print("\nОставшиеся LoRA-ключи:")
-lora_keys = [
-    key for key in merged
-    if "lora_" in key.lower() or "adapter" in key.lower()
+ERROR_COLUMNS = [
+    "repetition",
+    "grammar",
+    "lexical_anomaly",
+    "coherence",
+    "template_degeneration",
+    "context_hallucination",
+    "unsupported_claim",
 ]
 
-if lora_keys:
-    print(*lora_keys, sep="\n")
-else:
-    print("Нет")
+
+# Более серьезные смысловые ошибки имеют больший вес
+WEIGHTS = {
+    "repetition": 1,
+    "grammar": 1,
+    "lexical_anomaly": 1,
+    "coherence": 2,
+    "template_degeneration": 1,
+    "context_hallucination": 3,
+    "unsupported_claim": 3,
+}
+
+
+MAX_WEIGHTED_ERROR = 3 * sum(WEIGHTS.values())
+# 36
+
+
+# ============================================================
+# JUDGE SYSTEM
+# ============================================================
+
+JUDGE_SYSTEM = """
+Ты независимый evaluator качества генерации диалогового агента.
+
+Тебе будет дана история диалога и один конкретный ответ агента.
+
+НЕ оценивай:
+- соблюдение бизнес-алгоритма;
+- правильность выбранного этапа;
+- правильность стратегии взыскания;
+- хороший ли вариант предложил агент.
+
+Оценивай только качество сгенерированного ответа.
+
+Для каждой категории поставь целое число:
+
+0 = ошибки нет
+1 = небольшая ошибка
+2 = заметная ошибка
+3 = серьезная ошибка
+
+
+1. repetition
+
+Ненужные повторы:
+- слов;
+- словосочетаний;
+- предложений;
+- одной и той же мысли;
+- почти одинаковых формулировок.
+
+Не считай нормальное уточнение повтором.
+
+
+2. grammar
+
+Грамматические ошибки:
+- неправильные окончания;
+- падежи;
+- род;
+- число;
+- согласование;
+- формы глагола;
+- сломанная грамматическая конструкция.
+
+Не считай просто неидеальный стиль грамматической ошибкой.
+
+
+3. lexical_anomaly
+
+Лексические дефекты:
+- несуществующие слова;
+- поврежденные слова;
+- неправильные словоформы;
+- явно неуместное слово;
+- странная фраза, похожая на ошибку генерации.
+
+
+4. coherence
+
+Нарушение связности:
+- предложение оборвано;
+- части ответа противоречат друг другу;
+- бессмысленные фрагменты;
+- резкий нелогичный переход;
+- ответ трудно понять из-за структуры.
+
+
+5. template_degeneration
+
+Шаблонная деградация:
+- постоянное повторение одинаковых вводных фраз;
+- механическое копирование предыдущих ответов;
+- зацикливание на одной конструкции;
+- чрезмерно шаблонная повторяющаяся генерация.
+
+
+6. context_hallucination
+
+Агент приписывает клиенту информацию,
+которой клиент НЕ сообщал.
+
+Например:
+- клиент якобы согласился, хотя не соглашался;
+- клиент якобы называл сумму, хотя не называл;
+- агент утверждает наличие родственников, работы, дохода и т.д.,
+  хотя клиент этого не говорил.
+
+
+7. unsupported_claim
+
+Агент утверждает как факт информацию,
+которая не подтверждается историей диалога.
+
+Например:
+- выдуманная договоренность;
+- выдуманный срок;
+- выдуманная сумма;
+- утверждение, что клиент обещал сделать что-то;
+- утверждение, что действие уже согласовано,
+  хотя этого в диалоге не было.
+
+Не считай обычную рекомендацию выдуманным фактом.
+
+
+reason:
+краткое объяснение результата.
+Максимум 2 предложения.
+Укажи только наиболее заметные проблемы.
+Если проблем нет:
+"Существенных дефектов не обнаружено."
+
+
+Верни ТОЛЬКО валидный JSON:
+
+{
+  "repetition": 0,
+  "grammar": 0,
+  "lexical_anomaly": 0,
+  "coherence": 0,
+  "template_degeneration": 0,
+  "context_hallucination": 0,
+  "unsupported_claim": 0,
+  "reason": "..."
+}
+
+Никакого markdown.
+Никакого текста до JSON.
+Никакого текста после JSON.
+"""
+
+
+# ============================================================
+# JSON PARSER
+# ============================================================
+
+def extract_json(text):
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+
+    except json.JSONDecodeError:
+        pass
+
+    text = re.sub(
+        r"```(?:json)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = text.replace("```", "").strip()
+
+    try:
+        return json.loads(text)
+
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(
+            f"Judge returned invalid JSON:\n{text}"
+        )
+
+    candidate = text[start:end + 1]
+
+    return json.loads(candidate)
+
+
+# ============================================================
+# FORMAT HISTORY
+# ============================================================
+
+def format_history(messages):
+    lines = []
+
+    for message in messages:
+
+        role = message["role"]
+        content = message["content"]
+
+        if role == "assistant":
+            speaker = "AGENT"
+
+        elif role in ("user", "client"):
+            speaker = "CLIENT"
+
+        else:
+            continue
+
+        lines.append(
+            f"{speaker}: {content}"
+        )
+
+    if not lines:
+        return "История отсутствует."
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# OLLAMA JUDGE
+# ============================================================
+
+def call_quality_judge(
+    history,
+    target_response,
+    max_retries=2,
+):
+
+    history_text = format_history(history)
+
+    user_prompt = f"""
+ИСТОРИЯ ДИАЛОГА ДО ОЦЕНИВАЕМОГО ОТВЕТА:
+
+========================
+{history_text}
+========================
+
+ОЦЕНИВАЕМЫЙ ОТВЕТ AGENT:
+
+========================
+{target_response}
+========================
+
+Оцени только этот ответ AGENT.
+
+Историю используй для определения:
+- повторов;
+- шаблонной деградации;
+- приписывания клиенту несуществующей информации;
+- выдуманных фактов и договоренностей.
+
+Верни только JSON заданного формата.
+"""
+
+    for attempt in range(max_retries + 1):
+
+        payload = {
+            "model": JUDGE_MODEL,
+
+            "messages": [
+                {
+                    "role": "system",
+                    "content": JUDGE_SYSTEM,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+
+            "stream": False,
+
+            "think": False,
+
+            "format": "json",
+
+            "options": {
+                "temperature": 0,
+                "num_ctx": NUM_CTX,
+                "num_predict": NUM_PREDICT,
+            },
+        }
+
+        response = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=300,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        content = data["message"]["content"]
+
+        try:
+            result = extract_json(content)
+
+            # Проверяем наличие обязательных полей
+            for field in ERROR_COLUMNS:
+                if field not in result:
+                    raise ValueError(
+                        f"Missing field: {field}"
+                    )
+
+            # нормализуем значения
+            for field in ERROR_COLUMNS:
+                value = int(result[field])
+
+                result[field] = max(
+                    0,
+                    min(3, value),
+                )
+
+            return result
+
+        except Exception as e:
+
+            print(
+                f"JSON error attempt "
+                f"{attempt + 1}/{max_retries + 1}: {e}"
+            )
+
+            print(
+                "RAW:",
+                repr(content)
+            )
+
+            print(
+                "done_reason:",
+                data.get("done_reason")
+            )
+
+            if attempt == max_retries:
+                raise
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+def calculate_integrity_score(result):
+    weighted_error = 0
+
+    for category, weight in WEIGHTS.items():
+
+        value = int(
+            result.get(
+                category,
+                0,
+            )
+        )
+
+        weighted_error += (
+            value * weight
+        )
+
+    score = 100 * (
+        1
+        - weighted_error
+        / MAX_WEIGHTED_ERROR
+    )
+
+    return max(
+        0,
+        min(100, score)
+    )
+
+
+# ============================================================
+# EVALUATE ONE DIALOG
+# ============================================================
+
+def evaluate_dialog(
+    dialog,
+    system_name,
+    dialog_id,
+):
+
+    rows = []
+
+    assistant_turn = 0
+
+    for message_index, message in enumerate(dialog):
+
+        if message["role"] != "assistant":
+            continue
+
+        assistant_turn += 1
+
+        target_response = message["content"]
+
+        # Вся история ДО текущего ответа
+        history = dialog[:message_index]
+
+        print(
+            f"[{system_name}] "
+            f"dialog {dialog_id}, "
+            f"turn {assistant_turn}"
+        )
+
+        try:
+
+            result = call_quality_judge(
+                history=history,
+                target_response=target_response,
+            )
+
+            integrity_score = (
+                calculate_integrity_score(
+                    result
+                )
+            )
+
+            # Ответ вообще без ошибок
+            clean_response = int(
+                all(
+                    result[field] == 0
+                    for field in ERROR_COLUMNS
+                )
+            )
+
+            # Смысловая hallucination
+            hallucination = int(
+                result[
+                    "context_hallucination"
+                ] > 0
+                or
+                result[
+                    "unsupported_claim"
+                ] > 0
+            )
+
+            row = {
+                "system":
+                    system_name,
+
+                "dialog_id":
+                    dialog_id,
+
+                "assistant_turn":
+                    assistant_turn,
+
+                "response_integrity_score":
+                    integrity_score,
+
+                "clean_response":
+                    clean_response,
+
+                "hallucination":
+                    hallucination,
+
+                "reason":
+                    result.get(
+                        "reason",
+                        "",
+                    ),
+            }
+
+            for field in ERROR_COLUMNS:
+                row[field] = result[field]
+
+            rows.append(row)
+
+        except Exception as e:
+
+            print(
+                f"ERROR in {system_name}, "
+                f"dialog {dialog_id}, "
+                f"turn {assistant_turn}: "
+                f"{e}"
+            )
+
+    return rows
+
+
+# ============================================================
+# EVALUATE SYSTEM
+# ============================================================
+
+def evaluate_system(
+    dialogs,
+    system_name,
+):
+
+    rows = []
+
+    for dialog_id, dialog in enumerate(
+        dialogs,
+        1,
+    ):
+
+        dialog_rows = evaluate_dialog(
+            dialog=dialog,
+            system_name=system_name,
+            dialog_id=dialog_id,
+        )
+
+        rows.extend(
+            dialog_rows
+        )
+
+    print(
+        f"{system_name}: "
+        f"{len(rows)} responses evaluated"
+    )
+
+    return rows
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def evaluate_generation_quality(
+    graph_dialogs,
+    prompt_dialogs,
+):
+
+    graph_rows = evaluate_system(
+        dialogs=graph_dialogs,
+        system_name="graph",
+    )
+
+    prompt_rows = evaluate_system(
+        dialogs=prompt_dialogs,
+        system_name="prompt",
+    )
+
+    rows = (
+        graph_rows
+        +
+        prompt_rows
+    )
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise RuntimeError(
+            "Не удалось оценить ни одного ответа."
+        )
+
+    df.to_csv(
+        OUTPUT_TURNS,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # ========================================================
+    # DIALOG LEVEL
+    # ========================================================
+
+    dialog_rows = []
+
+    for (
+        system,
+        dialog_id
+    ), group in df.groupby(
+        [
+            "system",
+            "dialog_id",
+        ]
+    ):
+
+        row = {
+            "system":
+                system,
+
+            "dialog_id":
+                dialog_id,
+
+            "responses":
+                len(group),
+
+            "response_integrity_score":
+                group[
+                    "response_integrity_score"
+                ].mean(),
+
+            "clean_response_rate":
+                group[
+                    "clean_response"
+                ].mean()
+                * 100,
+
+            "hallucination_rate":
+                group[
+                    "hallucination"
+                ].mean()
+                * 100,
+        }
+
+        for error in ERROR_COLUMNS:
+
+            row[
+                f"{error}_rate"
+            ] = (
+                (
+                    group[error] > 0
+                ).mean()
+                * 100
+            )
+
+        dialog_rows.append(row)
+
+    dialog_df = pd.DataFrame(
+        dialog_rows
+    )
+
+    dialog_df.to_csv(
+        OUTPUT_DIALOGS,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    summary = (
+        df
+        .groupby("system")
+        .agg(
+            responses=(
+                "assistant_turn",
+                "count",
+            ),
+
+            response_integrity_score=(
+                "response_integrity_score",
+                "mean",
+            ),
+
+            integrity_std=(
+                "response_integrity_score",
+                "std",
+            ),
+
+            clean_response_rate=(
+                "clean_response",
+                "mean",
+            ),
+
+            hallucination_rate=(
+                "hallucination",
+                "mean",
+            ),
+        )
+    )
+
+    summary[
+        "clean_response_rate"
+    ] *= 100
+
+    summary[
+        "hallucination_rate"
+    ] *= 100
+
+
+    # ========================================================
+    # ERROR RATES
+    # ========================================================
+
+    for error in ERROR_COLUMNS:
+
+        error_rate = (
+            df
+            .assign(
+                error_present=(
+                    df[error] > 0
+                ).astype(int)
+            )
+            .groupby("system")[
+                "error_present"
+            ]
+            .mean()
+            * 100
+        )
+
+        summary[
+            f"{error}_rate"
+        ] = error_rate
+
+
+    print()
+    print("=" * 120)
+    print("GENERATION QUALITY")
+    print("=" * 120)
+
+    print(
+        summary
+        .round(2)
+        .to_string()
+    )
+
+    return (
+        df,
+        dialog_df,
+        summary,
+    )
