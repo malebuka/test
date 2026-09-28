@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PCAS — Hybrid Anti-Fraud Pipeline · A4 portrait</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #edf1f5; }
+    main { display: flex; justify-content: center; padding: 20px; }
+    main > svg { display: block; width: min(100%, 800px); height: auto; background: white; box-shadow: 0 8px 30px #17283e20; }
+    @page { size: A4 portrait; margin: 10mm; }
+    @media print {
+      body { background: white; }
+      main { display: block; padding: 0; }
+      main > svg { width: 190mm; max-width: none; box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+<main>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1132" font-family="Segoe UI, Arial, sans-serif" role="img" aria-labelledby="title desc">
+  <title id="title">PCAS — Hybrid Anti-Fraud Pipeline · A4 portrait</title>
+  <desc id="desc">Input, rules and anomaly prediction lead to decisions. Ranking by A leads to assistants 1, 2, 3 and Level 4. All levels feed assistant 6 Quality and Audit. Auto-decline F, Ranking by A, Low risk and assistant 2 feed adaptation. Adaptation updates Level 2 and assistants 4, 5, 7; assistant 4 updates Level 1.</desc>
+  <defs>
+    <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#334155"/></marker>
+    <marker id="audit-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#0c887b"/></marker>
+    <marker id="signal-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#b76821"/></marker>
+    <marker id="update-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#7655a6"/></marker>
+    <marker id="rule-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#bc4257"/></marker>
+  </defs>
+  <style>
+    .title{font-size:23px;font-weight:700;fill:#17283e;text-anchor:middle}
+    .sub{font-size:13px;fill:#60738a;text-anchor:middle}
+    .section{font-size:16px;font-weight:700;fill:#8a4f1a}
+    .level{font-size:13px;font-weight:700;fill:#52647c;text-anchor:middle}
+    .name{font-size:16px;font-weight:700;fill:#203149;text-anchor:middle}
+    .detail{font-size:12px;fill:#52647c;text-anchor:middle}
+    .card{fill:#fff;stroke:#cbd8e6;stroke-width:1.4}
+    .flow,.audit,.signal,.update,.rule{fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+    .flow{stroke:#334155;marker-end:url(#flow-arrow)}
+    .audit{stroke:#0c887b}.audit-end{marker-end:url(#audit-arrow)}
+    .signal{stroke:#b76821;stroke-dasharray:6 5}.signal-end{marker-end:url(#signal-arrow)}
+    .update{stroke:#7655a6}.update-end{marker-end:url(#update-arrow)}
+    .rule{stroke:#bc4257;marker-end:url(#rule-arrow)}
+  </style>
+  <rect width="800" height="1132" fill="#fff"/>
+  <text class="title" x="400" y="34">PCAS — Hybrid Anti-Fraud Pipeline</text>
+  <text class="sub" x="400" y="57">Detection — Verification — Adaptation</text>
+
+  <!-- Level 3 zone is behind all connections. -->
+  <rect x="70" y="365" width="665" height="450" rx="18" fill="#fff8ee" stroke="#e6c895" stroke-width="1.5"/>
+  <text class="section" x="94" y="393">LEVEL 3 — HUMAN–MACHINE TEAMING</text>
+  <text x="94" y="410" font-size="12" fill="#936633">AI assistants</text>
+
+  <!-- Operational sequence. -->
+  <g class="flow">
+    <path d="M210 135 H250"/>
+    <path d="M400 135 H440"/>
+    <path d="M325 180 V205 H145 V225"/>
+    <path d="M500 190 V208 H465 V225"/>
+    <path d="M660 190 V225"/>
+    <path d="M665 285 V328 Q665 338 655 338 H195 Q185 338 185 348 V430"/>
+    <path d="M285 475 H305"/>
+    <path d="M495 475 H515"/>
+    <path d="M720 475 H754 V825 H618 V845"/>
+  </g>
+
+  <!-- Quality and Audit: one shared green collection rail. -->
+  <g class="audit">
+    <path d="M325 100 V78 H775 V885"/>
+    <path d="M590 85 V91 H775"/>
+    <path d="M735 390 H775"/>
+    <path d="M720 885 H775"/>
+    <path d="M775 771 H720" class="audit-end"/>
+  </g>
+  <g fill="#0c887b"><circle cx="775" cy="78" r="3.6"/><circle cx="775" cy="91" r="3.6"/><circle cx="775" cy="390" r="3.6"/><circle cx="775" cy="885" r="3.6"/></g>
+
+  <!-- Four outcomes flow into adaptation on the left. -->
+  <g class="signal">
+    <path d="M18 255 V940 Q18 952 30 952 H245 V990" class="signal-end"/>
+    <path d="M70 255 H18"/>
+    <path d="M465 285 V307 H18"/>
+    <path d="M615 285 V322 H18"/>
+    <path d="M400 525 V550 H18"/>
+  </g>
+  <g fill="#b76821"><circle cx="18" cy="255" r="3.5"/><circle cx="18" cy="307" r="3.5"/><circle cx="18" cy="322" r="3.5"/><circle cx="18" cy="550" r="3.5"/></g>
+
+  <!-- Adaptation to Level 2 and the three Level 3 assistants. -->
+  <g class="update">
+    <path d="M245 1034 H40 V215 H426 Q436 215 436 205 V150 H440" class="update-end"/>
+    <path d="M400 990 V715 H618"/>
+    <path d="M400 715 H190"/>
+    <path d="M190 715 V685" class="update-end"/>
+    <path d="M400 715 V685" class="update-end"/>
+    <path d="M618 715 V685" class="update-end"/>
+  </g>
+  <g fill="#7655a6"><circle cx="190" cy="715" r="3.5"/><circle cx="400" cy="715" r="3.5"/><circle cx="618" cy="715" r="3.5"/></g>
+
+  <!-- Item 4 updates Level 1; the white underlay separates line crossings. -->
+  <path d="M95 636 H62 V195 H285 V180" fill="none" stroke="#fff" stroke-width="7" stroke-linejoin="round"/>
+  <path class="rule" d="M95 636 H62 V195 H285 V180"/>
+
+  <!-- Top cards. -->
+  <rect class="card" x="70" y="100" width="140" height="70" rx="13" fill="#f0f8fe"/>
+  <text class="name" x="140" y="128">Input Stream</text><text class="detail" x="140" y="151">Domain D</text>
+
+  <rect x="250" y="100" width="150" height="80" rx="13" fill="#fff5df" stroke="#dfb96d" stroke-width="1.4"/>
+  <text class="level" x="325" y="122">LEVEL 1</text><text class="name" x="325" y="145">Rules Engine</text>
+  <text class="detail" x="325" y="164">hard stops + soft rules</text>
+
+  <rect x="440" y="85" width="305" height="105" rx="13" fill="#f4f0ff" stroke="#b6a7df" stroke-width="1.4"/>
+  <text class="level" x="592" y="107">LEVEL 2 — Anomaly Predictor</text>
+  <g fill="#fff" stroke="#d7cdf0" stroke-width="1">
+    <rect x="451" y="119" width="91" height="59" rx="8"/><rect x="547" y="119" width="91" height="59" rx="8"/><rect x="643" y="119" width="91" height="59" rx="8"/>
+  </g>
+  <g class="name" font-size="15"><text x="496" y="140">f₁</text><text x="592" y="140">f₂</text><text x="688" y="140">f₃</text></g>
+  <g class="detail" font-size="11"><text x="496" y="162">Fraud score F</text><text x="592" y="162">Anomaly A</text><text x="688" y="162">Text signal T</text></g>
+
+  <rect x="70" y="225" width="150" height="60" rx="12" fill="#eaf8ee" stroke="#8bcba6" stroke-width="1.4"/>
+  <text class="name" x="145" y="250">Low risk</text><text class="detail" x="145" y="271">auto-approve</text>
+
+  <rect x="385" y="225" width="160" height="60" rx="12" fill="#eaf8ee" stroke="#8bcba6" stroke-width="1.4"/>
+  <text class="name" x="465" y="249">Auto-decline (F)</text>
+
+  <rect x="585" y="225" width="160" height="60" rx="12" fill="#eaf2ff" stroke="#9cbdea" stroke-width="1.4"/>
+  <text class="name" x="665" y="249">Ranking by A</text><text class="detail" x="665" y="271">→ investigator queue</text>
+
+  <!-- Level 3: large labels remain readable when the page is scaled to A4. -->
+  <g class="card">
+    <rect x="85" y="430" width="200" height="95" rx="12"/><rect x="305" y="430" width="190" height="95" rx="12"/><rect x="515" y="430" width="205" height="95" rx="12"/>
+    <rect x="85" y="590" width="200" height="95" rx="12"/><rect x="305" y="590" width="190" height="95" rx="12"/><rect x="515" y="590" width="205" height="95" rx="12"/>
+    <rect x="515" y="735" width="205" height="70" rx="12"/>
+  </g>
+  <g class="name">
+    <text x="185" y="455">1. Investigator</text><text x="185" y="474">Assistant</text>
+    <text x="400" y="455">2. Customer</text><text x="400" y="474">Verification</text>
+    <text x="617" y="455">3. Ecosystem</text><text x="617" y="474">Coordination</text>
+    <text x="185" y="616">4. Rule Assistant</text><text x="400" y="616">5. Trainer–Emulator</text><text x="617" y="616">7. Knowledge Curator</text>
+    <text x="617" y="761">6. Quality &amp; Audit</text>
+  </g>
+  <g class="detail">
+    <text x="185" y="495">case narrative from f₃</text><text x="185" y="511">· Q&amp;A</text>
+    <text x="400" y="495">verification dialogues</text><text x="400" y="511">· escalation</text>
+    <text x="617" y="495">gateway to Level 4</text><text x="617" y="511">· logged exchanges</text>
+    <text x="185" y="643">candidate rules</text><text x="185" y="660">· impact estimates</text>
+    <text x="400" y="643">synthetic cases</text><text x="400" y="660">· competency scoring</text>
+    <text x="617" y="643">playbooks</text><text x="617" y="660">· attack-type mapping</text>
+    <text x="617" y="780">provenance log</text><text x="617" y="797">· fairness monitoring</text>
+  </g>
+
+  <rect x="515" y="845" width="205" height="80" rx="12" fill="#eaf8ee" stroke="#8bcba6" stroke-width="1.4"/>
+  <text class="level" x="617" y="865">LEVEL 4</text><text class="name" x="617" y="885">EXTERNAL CONTOUR</text>
+  <text class="detail" x="617" y="903">state monitoring · telecom</text>
+  <text class="detail" x="617" y="918">verification · inter-bank blocking</text>
+
+  <rect x="245" y="990" width="310" height="83" rx="14" fill="#fff6e8" stroke="#dba96b" stroke-width="1.5"/>
+  <text class="name" x="400" y="1015">ADAPTATION LOOP</text>
+  <text class="detail" x="400" y="1035">verified outcomes → feature store</text>
+  <text class="detail" x="400" y="1052">online learning (f₁) · bound update (f₂)</text>
+  <text class="detail" x="400" y="1067">· AI-proposed rules</text>
+
+  <!-- Legend. -->
+  <g font-size="12" fill="#52647c">
+    <line x1="44" y1="1100" x2="68" y2="1100" stroke="#334155" stroke-width="2"/><text x="76" y="1104">flow</text>
+    <line x1="143" y1="1100" x2="167" y2="1100" stroke="#0c887b" stroke-width="2"/><text x="175" y="1104">audit</text>
+    <line x1="252" y1="1100" x2="276" y2="1100" stroke="#b76821" stroke-width="2" stroke-dasharray="6 5"/><text x="284" y="1104">to adaptation</text>
+    <line x1="444" y1="1100" x2="468" y2="1100" stroke="#7655a6" stroke-width="2"/><text x="476" y="1104">from adaptation</text>
+    <line x1="655" y1="1100" x2="679" y2="1100" stroke="#bc4257" stroke-width="2"/><text x="687" y="1104">4 → Level 1</text>
+  </g>
+</svg>
+</main>
+</body>
+</html>
