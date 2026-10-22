@@ -1,0 +1,1068 @@
+"""
+Toy simulation for intelligent allocation of delinquent clients to collection agents.
+
+Model:
+- 20 clients, 4 agents, 4 one-hour slots: 09, 10, 11, 12.
+- Each client can be called at most once per day.
+- Each agent can call exactly one client per hour.
+- Response probability is client x hour and is fixed across Monte-Carlo runs.
+- Agent-client effectiveness is agent x client, redrawn once per simulated day.
+  Its matrix mean is forced to exactly AGENT_EFF_MEAN in every simulation.
+- All debts are equal, so maximizing expected collected amount is equivalent
+  to maximizing expected number of successful collections.
+- Success probability for a call:
+      q(client, agent, hour) = p_response(client, hour) * agent_effectiveness(agent, client)
+
+Policies:
+1. Random
+2. Carousel: top current response probability, sequential assignment to agents
+3. Hourly greedy: current-hour max-weight matching using q
+4. Full-horizon optimum: max-weight matching over all 16 day slots
+5. Rolling horizon: re-solves remaining horizon each hour
+
+The experiment runs N_SIMULATIONS full-day Monte-Carlo simulations.
+Therefore each policy has N_SIMULATIONS observations for each hour.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import linear_sum_assignment
+
+#%%
+
+# ============================================================
+# Configuration
+# ============================================================
+
+SEED = 42
+
+N_CLIENTS = 20#40
+N_AGENTS = 4
+HOURS = np.array([9, 10, 11, 12], dtype=int)#np.array([9, 10, 11, 12, 13, 14, 15, 16, 17], dtype=int)
+N_HOURS = len(HOURS)
+
+# пока задолженность одинаковая, потом надо учитывать разницу, а не только вероятности, для максимизации суммы взыскания
+N_SIMULATIONS = 1_000#_000
+DEBT_PER_CLIENT = 100_000.0 #max N успешных взысканий = max сумма взысканий
+
+# response probabilities.
+MIN_RESPONSE_P = 0.02
+MAX_RESPONSE_P = 0.80
+
+# Mean is exactly this value in every simulated agent-client matrix.
+AGENT_EFF_MEAN = 0.50
+AGENT_EFF_HALF_RANGE = 0.15
+
+OUTPUT_DIR = Path(r"C:\Users\U2203203\Documents\myfolder\optim_collect\simulation_output_4h_1000_000sim")
+
+POLICY_ORDER = [
+    "Random",
+    "Carousel",
+    "Hourly greedy",
+    "Full-horizon optimum",
+    #"Rolling horizon",
+]
+
+#%%
+
+# ============================================================
+# Data structures
+# ============================================================
+
+#структура для одного назначения 
+
+@dataclass(frozen=True)
+class Assignment:
+    hour_idx: int
+    agent: int
+    client: int
+    
+#Пример, индексация начинается с нуля, hour_idx=2 => HOURS[2] == 11
+# Assigment(
+#     hour_idx=2,
+#     agent=1,
+#     client=7
+#     )
+
+#%%
+# ============================================================
+# Synthetic data
+# ============================================================
+
+# генерация вероятности отклика, возвращает матрицу 20 клиентов Х 4 часа p_response.shape=(20,4)
+
+# def make_response_probabilities_old(rng: np.random.Generator) -> np.ndarray:
+#     """
+#     Create fixed client x hour response probabilities.
+
+#     We intentionally give clients different intraday shapes, so some customers
+#     are more valuable later and should be held back by a horizon-aware policy.
+#     """
+#     #общий уровень склонности к ответу для каждого клиента (не завсисит пока от часа)
+#     base = rng.uniform(0.04, 0.15, size=N_CLIENTS) 
+
+#     # 4 простых паттерна
+#     # пример: первый паттерн [0.85, 0.95, 1.15, 1.45] означает, что клиент лучше отвечает ближе к 12
+#     # пример: если базовая вероятность 0.10, то будет приблизительно 
+#     # 09:00 -> 0.085
+#     # 10:00 -> 0.095
+#     # 11:00 -> 0.115
+#     # 12:00 -> 0.145
+#     patterns = np.array([
+#         [0.85, 0.95, 1.15, 1.45],  # rising through the day
+#         [1.40, 1.15, 0.95, 0.75],  # falling through the day
+#         [0.90, 1.40, 1.10, 0.90],  # peak at 10
+#         [0.85, 1.00, 1.45, 1.05],  # peak at 11
+#     ])
+    
+#     # patterns = np.array([
+#     #     [0.85, 0.95, 1.15, 1.45, 0.75, 1.38, 0.56, 1.44, 0.57],  # rising through the day
+#     #     [1.40, 1.15, 0.95, 0.75, 0.75, 1.38, 0.56, 0.57, 1.44],  # falling through the day
+#     #     [0.90, 1.40, 1.10, 0.90, 0.75, 1.38, 0.57, 1.44,0.56],  # peak at 10
+#     #     [0.85, 1.00, 1.45, 1.05, 0.75, 1.38, 1.44, 0.57, 0.56],  # peak at 11
+#     # ])
+
+#     p = np.empty((N_CLIENTS, N_HOURS), dtype=float)
+
+#     for client in range(N_CLIENTS):
+#         intraday = patterns[client % len(patterns)]
+#         #добавляем небольшую случайность, чтоб профили были не слишком искусственными
+#         small_noise = rng.normal(loc=1.0, scale=0.06, size=N_HOURS)
+#         p[client] = base[client] * intraday * small_noise
+
+#     #ограничиваем вероятность
+#     p = np.clip(p, MIN_RESPONSE_P, MAX_RESPONSE_P)
+
+#     # Explicit example of a client that is much more attractive later.
+#     # специальный тестовый пример для проверки алгоритма
+#     p[0] = np.array([0.04, 0.06, 0.15, 0.28])
+#     #p[0] = np.array([0.04, 0.06, 0.15, 0.28, 0.36, 0.1, 0.12, 0.05, 0.23]) #для 9 часов 
+
+#     return p
+
+def make_response_probabilities(rng: np.random.Generator) -> np.ndarray:
+    """
+    Create fixed client x hour response probabilities.
+
+    We intentionally give clients different intraday shapes, so some customers
+    are more valuable later and should be held back by a horizon-aware policy.
+    """
+    #общий уровень склонности к ответу для каждого клиента (не завсисит пока от часа)
+    base = rng.uniform(0.04, 0.55, size=N_CLIENTS) 
+
+    p = np.empty((N_CLIENTS, N_HOURS), dtype=float)
+
+    for client in range(N_CLIENTS):
+        # случайное изменение вероятности внутри дня.
+        #hourly_noise = rng.normal(loc=0.0, scale=0.1, size=N_HOURS)
+        hourly_noise = np.zeros(N_HOURS)
+        hourly_noise[0] = rng.normal(0.0, 0.08)
+        
+        for hour in range(1, N_HOURS):
+            hourly_noise[hour] = (
+                0.6 * hourly_noise[hour-1] + rng.normal(0.0, 0.07)
+                )
+        p[client] = base[client] + hourly_noise
+
+    #ограничиваем вероятность
+    p = np.clip(p, MIN_RESPONSE_P, MAX_RESPONSE_P)
+
+
+    return p
+
+# создаем матрицу 4 агента Х 20 клиентов
+def make_agent_effectiveness(rng: np.random.Generator) -> np.ndarray:
+    """
+    Agent x client matrix, redrawn once per simulated day.
+
+    The matrix mean is EXACTLY AGENT_EFF_MEAN in every simulation.
+    The half-range is small enough that centering cannot leave [0, 1].
+    """
+    #отклонения [-AGENT_EFF_HALF_RANGE;+AGENT_EFF_HALF_RANGE]
+    offsets = rng.uniform(
+        -AGENT_EFF_HALF_RANGE,
+        AGENT_EFF_HALF_RANGE,
+        size=(N_AGENTS, N_CLIENTS),
+    )
+    # среднее offsets становится 0
+    offsets -= offsets.mean()
+    #mean(eff) == 0.50
+    eff = AGENT_EFF_MEAN + offsets
+
+    # Numerical guard only; by construction values should be safely in [0, 1].
+    # проверка
+    if not np.all((eff >= 0.0) & (eff <= 1.0)):
+        raise RuntimeError("Agent effectiveness left [0, 1].")
+
+    if not np.isclose(eff.mean(), AGENT_EFF_MEAN, atol=1e-12):
+        raise RuntimeError("Agent matrix mean is not preserved.")
+
+    return eff
+
+#%%
+# ============================================================
+# Optimization helpers
+# ============================================================
+
+# Функция расчитывает текущую ценность каждой комбинации agentXclient для конкретного часа
+# q(a,i,t) = p(i,t)*e(a,i)
+# пример -> клиент:p(response в 10:00) = 0.2, агент: efficiency=0.50 -> P(success) = 0.2*0.6=0.12
+# другой агент: efficienty=0.65 -> P(success) = 0.2*0.65=0.15
+# следовательно второй агент выгоднее
+def score_matrix_for_hour(
+    p_response: np.ndarray,
+    agent_eff: np.ndarray,
+    hour_idx: int,
+    clients: np.ndarray,
+) -> np.ndarray:
+    """
+    Matrix [agent, client] of expected success probabilities for one hour.
+    """
+    return agent_eff[:, clients] * p_response[clients, hour_idx][None, :]
+
+# решает, как распределить доступных клиентов по оставшимся часовым слотам.
+# всего 16 слотов, в каждый час по 4 агента
+def optimize_slots(
+    p_response: np.ndarray,
+    agent_eff: np.ndarray,
+    clients: Iterable[int],
+    start_hour_idx: int,
+) -> List[Assignment]:
+    """
+    Solve maximum-weight assignment over all slots from start_hour_idx to end.
+
+    Rows = (hour, agent) slots.
+    Columns = eligible clients.
+    linear_sum_assignment minimizes, so we pass negative expected value.
+    """
+    clients = np.array(sorted(clients), dtype=int)
+
+    # создание списка слотов, для полного дня получится [(0, 0), (0, 1), (0, 2), (0, 3), ... , (3, 0), (3, 1), (3, 2), (3, 3)]
+    slots: List[Tuple[int, int]] = [
+        (hour_idx, agent)
+        for hour_idx in range(start_hour_idx, N_HOURS)
+        for agent in range(N_AGENTS)
+    ]
+
+    # матрица weights, получаем таблицу slotXclient, каждая ячейка P(response)*agent_efficiency
+    weights = np.zeros((len(slots), len(clients)), dtype=float)
+
+    # заполнение weights, например: строка 11:00, agent 3 содержит ожидаемую успешность этого оператора для каждого еще доступного клиента
+    for row, (hour_idx, agent) in enumerate(slots):
+        weights[row, :] = (
+            p_response[clients, hour_idx] * agent_eff[agent, clients]
+        )
+    
+    # оптимизация
+    # дано: 16 слотов, 20 клиентов, алгоритм выберет 16 клиентов из 20, каждому ровно один слот, каждый слот получит одного клиента
+    # так, чтобы sum(q(i, a, t)) была максимально возможной
+    row_idx, col_idx = linear_sum_assignment(-weights)
+
+    return [
+        Assignment(
+            hour_idx=slots[row][0],
+            agent=slots[row][1],
+            client=int(clients[col]),
+        )
+        for row, col in zip(row_idx, col_idx)
+    ]
+
+# Каждая колонка client может быть выбрана максимум один раз, поэтому client 3 не может одновременно получить 9:00 agent 1 и 12:00 agent 4.
+
+# результат будет примерно: [Assigment(0, 0, 15), Assigment(0, 1, 7), Assigment(0, 2, 12), Assigment(0, 3, 4), ...] - расписание дня
+#%%
+# ============================================================
+# Policies
+# ============================================================
+
+# тут начинаются стратегии
+
+
+# самый тупой baseline, каждый час выбирает 4 случайных еще не обзвоненных клиента
+def policy_random(
+    rng: np.random.Generator,
+) -> List[Assignment]:
+    """
+    Randomly choose 4 not-yet-called clients each hour and randomly assign them.
+    """
+    remaining = list(range(N_CLIENTS))
+    schedule: List[Assignment] = []
+
+    for hour_idx in range(N_HOURS):
+        chosen = rng.choice(remaining, size=N_AGENTS, replace=False).tolist()
+        agent_order = rng.permutation(N_AGENTS)
+
+        for agent, client in zip(agent_order, chosen):
+            schedule.append(Assignment(hour_idx, int(agent), int(client)))
+
+        chosen_set = set(chosen)
+        remaining = [c for c in remaining if c not in chosen_set]
+
+    return schedule
+
+# Carousel
+# Каждый час смотрим только на текущую вероятность отклика
+def policy_carousel(
+    p_response: np.ndarray,
+) -> List[Assignment]:
+    """
+    Baseline carousel:
+    - every hour rank remaining clients by CURRENT response probability;
+    - take top 4;
+    - give them to agents 0,1,2,3 without agent-client optimization.
+    """
+    remaining = set(range(N_CLIENTS))
+    schedule: List[Assignment] = []
+
+    for hour_idx in range(N_HOURS):
+        ranked = sorted(
+            remaining,
+            key=lambda c: p_response[c, hour_idx],
+            reverse=True,
+        )
+        chosen = ranked[:N_AGENTS]
+
+        for agent, client in enumerate(chosen):
+            schedule.append(Assignment(hour_idx, agent, client))
+
+        remaining.difference_update(chosen)
+
+    return schedule
+
+# Hourly greedy
+# использует P(response)*agent_efficienty, но все еще смотрит только на текущий час
+def policy_hourly_greedy(
+    p_response: np.ndarray,
+    agent_eff: np.ndarray,
+) -> List[Assignment]:
+    """
+    Agent-aware greedy:
+    maximize current-hour q = response probability * agent effectiveness.
+    It ignores all future hours.
+    """
+    remaining = set(range(N_CLIENTS))
+    schedule: List[Assignment] = []
+
+    for hour_idx in range(N_HOURS):
+        clients = np.array(sorted(remaining), dtype=int)
+        weights = score_matrix_for_hour(
+            p_response, agent_eff, hour_idx, clients
+        )
+
+        agent_rows, client_cols = linear_sum_assignment(-weights)
+
+        called_now = []
+        for agent, col in zip(agent_rows, client_cols):
+            client = int(clients[col])
+            schedule.append(
+                Assignment(hour_idx, int(agent), client)
+            )
+            called_now.append(client)
+
+        remaining.difference_update(called_now)
+
+    return schedule
+
+#Full-horizen optimum
+#берет сразу весь день с 09 до 12 и решает оптимальное распределение всех 16 звонковых слотов
+def policy_full_horizon(
+    p_response: np.ndarray,
+    agent_eff: np.ndarray,
+) -> List[Assignment]:
+    """
+    Optimize all 16 slots jointly at the beginning of the day.
+    """
+    return optimize_slots(
+        p_response=p_response,
+        agent_eff=agent_eff,
+        clients=range(N_CLIENTS),
+        start_hour_idx=0,
+    )
+
+#rolling horizon
+#логика похожая, но не строится один неизменный план утром. В 09:00 оптимизирует 09-12, потом в 10: заново оптимизирует 10-12 и так далее
+# сейчас одинковая с full-horizen, адаптируется, когда у агента изменяется статус, появляется новые клиенты, пересчитался p(response)
+def policy_rolling_horizon(
+    p_response: np.ndarray,
+    agent_eff: np.ndarray,
+) -> List[Assignment]:
+    """
+    Re-optimize all remaining hours at the beginning of every hour,
+    execute only the current-hour assignments, then repeat.
+
+    With static probabilities and no new information this should be very close
+    to the full-horizon optimum. It becomes materially different once forecasts
+    or constraints update during the day.
+    """
+    remaining = set(range(N_CLIENTS))
+    schedule: List[Assignment] = []
+
+    for current_hour_idx in range(N_HOURS):
+        plan = optimize_slots(
+            p_response=p_response,
+            agent_eff=agent_eff,
+            clients=remaining,
+            start_hour_idx=current_hour_idx,
+        )
+
+        execute_now = [
+            x for x in plan if x.hour_idx == current_hour_idx
+        ]
+        schedule.extend(execute_now)
+
+        remaining.difference_update(x.client for x in execute_now)
+
+    return schedule
+
+#%%
+# ============================================================
+# Monte-Carlo engine
+# ============================================================
+
+def simulate_schedule(
+    schedule: List[Assignment],
+    p_response: np.ndarray,
+    agent_eff: np.ndarray,
+    common_uniforms: np.ndarray,
+) -> List[dict]:
+    """
+    Simulate actual collection results for a schedule.
+
+    common_uniforms[hour, agent, client] is shared across policies inside a
+    simulation. This is a common-random-numbers variance-reduction technique.
+    """
+    rows = []
+
+    for x in schedule:
+        q = (
+            p_response[x.client, x.hour_idx]
+            * agent_eff[x.agent, x.client]
+        )
+        # для каждого звонка моделируется случайное число, пример: q=0.09, случайное число = 0.047, раз оно меньше - то успех, если случайное число = 0.71, то 0.71>0.09 -> неуспех
+        # bernoulli event
+        success = (
+            common_uniforms[x.hour_idx, x.agent, x.client] < q
+        )
+
+        rows.append({
+            "hour_idx": x.hour_idx,
+            "hour": int(HOURS[x.hour_idx]),
+            "agent": x.agent + 1,
+            "client": x.client + 1,
+            "p_response": float(p_response[x.client, x.hour_idx]),
+            "agent_effectiveness": float(agent_eff[x.agent, x.client]),
+            "success_probability": float(q),
+            "success": int(success),
+            "collected_amount": float(success) * DEBT_PER_CLIENT,
+        })
+
+    return rows
+
+
+# def run_experiment_old(
+#     seed: int = SEED,
+#     n_simulations: int = N_SIMULATIONS,
+# ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+#     """
+#     Returns:
+#       calls_df   - one row per attempted call
+#       hourly_df  - one row per simulation x policy x hour
+#       daily_df   - one row per simulation x policy
+#     """
+#     rng = np.random.default_rng(seed)
+
+#     # Fixed client-hour probabilities across all simulations.
+#     # создаем фиксированный clientXhour
+#     p_response = make_response_probabilities(rng)
+
+#     # Carousel does not depend on daily agent matrix.
+#     # создается один раз, фиксированный p_response
+#     fixed_carousel = policy_carousel(p_response)
+
+#     call_records: List[dict] = []
+
+#     for sim in range(n_simulations):
+#         # новая эффективность каждую симмуляцию, со заданным наверху средним
+#         agent_eff = make_agent_effectiveness(rng)
+
+#         # Common random numbers for fairer policy comparisons.
+#         common_uniforms = rng.random(
+#             size=(N_HOURS, N_AGENTS, N_CLIENTS)
+#         )
+        
+#         # 5 методов
+#         schedules: Dict[str, List[Assignment]] = {
+#             "Random": policy_random(rng),
+#             "Carousel": fixed_carousel,
+#             "Hourly greedy": policy_hourly_greedy(
+#                 p_response, agent_eff
+#             ),
+#             "Full-horizon optimum": policy_full_horizon(
+#                 p_response, agent_eff
+#             ),
+#            # "Rolling horizon": policy_rolling_horizon(
+#            #     p_response, agent_eff
+#            # ),
+#         }
+
+#         for policy, schedule in schedules.items():
+#             simulated_rows = simulate_schedule(
+#                 schedule=schedule,
+#                 p_response=p_response,
+#                 agent_eff=agent_eff,
+#                 common_uniforms=common_uniforms,
+#             )
+
+#             for row in simulated_rows:
+#                 row["simulation"] = sim
+#                 row["policy"] = policy
+#                 call_records.append(row)
+
+#     #1000 дней X 5 стратегий X 16 звонков = 80000 строк
+#     calls_df = pd.DataFrame(call_records)
+    
+#     #1000 X 5 X 4 = 20000 строк
+#     hourly_df = (
+#         calls_df
+#         .groupby(
+#             ["simulation", "policy", "hour"],
+#             as_index=False,
+#         )
+#         .agg(
+#             attempts=("success", "size"),
+#             collected_clients=("success", "sum"),
+#             collected_amount=("collected_amount", "sum"),
+#             expected_collected_clients=("success_probability", "sum"),
+#             mean_call_success_probability=("success_probability", "mean"),
+#         )
+#     )
+    
+#     #1000 X 5 = 5000
+#     daily_df = (
+#         hourly_df
+#         .groupby(
+#             ["simulation", "policy"],
+#             as_index=False,
+#         )
+#         .agg(
+#             collected_clients=("collected_clients", "sum"),
+#             collected_amount=("collected_amount", "sum"),
+#             expected_collected_clients=("expected_collected_clients", "sum"),
+#         )
+#     )
+
+#     return calls_df, hourly_df, daily_df
+
+
+def run_experiment(
+    seed: int = SEED,
+    n_simulations: int = N_SIMULATIONS,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      calls_df   - one row per attempted call
+      hourly_df  - one row per simulation x policy x hour
+      daily_df   - one row per simulation x policy
+    """
+    rng = np.random.default_rng(seed)
+
+    call_records: List[dict] = []
+
+    for sim in range(n_simulations):
+        
+        #в каждой симуляции новый случайный день
+        # новые почасовые вероятности отклика клиентов
+        p_response = make_response_probabilities(rng)
+        
+        # новая эффективность каждую симмуляцию (день), со заданным наверху средним
+        agent_eff = make_agent_effectiveness(rng)
+
+        # Common random numbers for fairer policy comparisons.
+        common_uniforms = rng.random(
+            size=(N_HOURS, N_AGENTS, N_CLIENTS)
+        )
+        
+        # 5 методов
+        schedules: Dict[str, List[Assignment]] = {
+            "Random": policy_random(rng),
+            "Carousel": policy_carousel(p_response), #fixed_carousel,
+            "Hourly greedy": policy_hourly_greedy(
+                p_response, agent_eff
+            ),
+            "Full-horizon optimum": policy_full_horizon(
+                p_response, agent_eff
+            ),
+           # "Rolling horizon": policy_rolling_horizon(
+           #     p_response, agent_eff
+           # ),
+        }
+
+        for policy, schedule in schedules.items():
+            simulated_rows = simulate_schedule(
+                schedule=schedule,
+                p_response=p_response,
+                agent_eff=agent_eff,
+                common_uniforms=common_uniforms,
+            )
+
+            for row in simulated_rows:
+                row["simulation"] = sim
+                row["policy"] = policy
+                call_records.append(row)
+
+    #1000 дней X 5 стратегий X 16 звонков = 80000 строк
+    calls_df = pd.DataFrame(call_records)
+    
+    #1000 X 5 X 4 = 20000 строк
+    hourly_df = (
+        calls_df
+        .groupby(
+            ["simulation", "policy", "hour"],
+            as_index=False,
+        )
+        .agg(
+            attempts=("success", "size"),
+            collected_clients=("success", "sum"),
+            collected_amount=("collected_amount", "sum"),
+            expected_collected_clients=("success_probability", "sum"),
+            mean_call_success_probability=("success_probability", "mean"),
+        )
+    )
+    
+    #1000 X 5 = 5000
+    daily_df = (
+        hourly_df
+        .groupby(
+            ["simulation", "policy"],
+            as_index=False,
+        )
+        .agg(
+            collected_clients=("collected_clients", "sum"),
+            collected_amount=("collected_amount", "sum"),
+            expected_collected_clients=("expected_collected_clients", "sum"),
+        )
+    )
+
+    return calls_df, hourly_df, daily_df
+
+#%%
+# ============================================================
+# Reporting
+# ============================================================
+
+# итоговая таблица по 1000 симуляциям
+# def make_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
+#     return (
+#         daily_df
+#         .groupby("policy")
+#         .agg(
+#             mean_actual_clients=("collected_clients", "mean"),
+#             std_actual_clients=("collected_clients", "std"),
+#             p10_actual_clients=(
+#                 "collected_clients",
+#                 lambda s: np.quantile(s, 0.10),
+#             ),
+#             median_actual_clients=("collected_clients", "median"),
+#             p90_actual_clients=(
+#                 "collected_clients",
+#                 lambda s: np.quantile(s, 0.90),
+#             ),
+#             mean_expected_clients=("expected_collected_clients", "mean"),
+#             mean_collected_amount=("collected_amount", "mean"),
+#         )
+#         .reindex(POLICY_ORDER)
+#         .reset_index()
+#     )
+
+def make_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
+    summary = (
+        daily_df
+        .groupby("policy")
+        .agg(
+            mean_collected=("collected_clients", "mean"),
+            median_collected=("collected_clients", "median"),
+            
+            p_zero=("collected_clients", lambda x: (x==0).mean()),
+            p_1plus=("collected_clients", lambda x: (x>=1).mean()),
+            p_2plus=("collected_clients", lambda x: (x>=2).mean()),
+            p_3plus=("collected_clients", lambda x: (x>=3).mean()),
+            
+            mean_amount=("collected_amount", "mean"),
+            mean_expected=("expected_collected_clients", "mean"),
+            
+            )
+            .reindex(POLICY_ORDER)
+            .reset_index()
+            
+    )
+
+
+    for col in ['p_zero', 'p_1plus', 'p_2plus', 'p_3plus']:
+        summary[col] = summary[col]*100
+        
+    return summary
+
+def make_hourly_summary(hourly_df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        hourly_df
+        .groupby(["policy", "hour"])
+        .agg(
+            mean_actual_clients=("collected_clients", "mean"),
+            mean_expected_clients=("expected_collected_clients", "mean"),
+            mean_collected_amount=("collected_amount", "mean"),
+        )
+        .reset_index()
+    )
+
+
+# def plot_daily_distribution_old(
+#     daily_df: pd.DataFrame,
+#     output_path: Path,
+# ) -> None:
+#     plt.figure(figsize=(10, 6))
+
+#     max_success = int(daily_df["collected_clients"].max())
+#     bins = np.arange(-0.5, max_success + 1.5, 1)
+
+#     for policy in POLICY_ORDER:
+#         values = daily_df.loc[
+#             daily_df["policy"] == policy,
+#             "collected_clients",
+#         ]
+#         plt.hist(
+#             values,
+#             bins=bins,
+#             alpha=0.25,
+#             label=policy,
+#         )
+
+#     plt.xlabel("Successful collections during the day")
+#     plt.ylabel("Number of Monte-Carlo simulations")
+#     plt.title("Daily result distribution by policy")
+#     plt.legend()
+#     plt.tight_layout()
+#     plt.savefig(output_path, dpi=160)
+#     plt.close()
+
+
+def plot_daily_distribution(
+    daily_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    plt.figure(figsize=(10, 6))
+
+    max_result = int(daily_df["collected_clients"].max())
+    
+    x = np.arange(0, max_result + 1)
+
+
+    for policy in POLICY_ORDER:
+        values = daily_df.loc[
+            daily_df["policy"] == policy,
+            "collected_clients",
+        ]
+        distribution = (values.value_counts().reindex(x, fill_value=0).sort_index())
+        distribution_pct = (distribution/len(values)*100)
+        
+        plt.plot(x, distribution_pct, marker="o", label=policy)
+
+    plt.xlabel("Количество успешных взысканий за день")
+    plt.ylabel("Доля симуляций, %")
+    plt.title("Распределение дневного результата")
+    plt.xticks(x)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+# def plot_hourly_distribution(
+#     hourly_df: pd.DataFrame,
+#     output_path: Path,
+# ) -> None:
+#     data = []
+#     labels = []
+
+#     for hour in HOURS:
+#         for policy in POLICY_ORDER:
+#             values = hourly_df.loc[
+#                 (hourly_df["hour"] == hour)
+#                 & (hourly_df["policy"] == policy),
+#                 "collected_clients",
+#             ].to_numpy()
+
+#             data.append(values)
+#             labels.append(f"{hour}:00\n{policy}")
+
+#     plt.figure(figsize=(17, 7))
+#     plt.boxplot(
+#         data,
+#         tick_labels=labels,
+#         showmeans=True,
+#     )
+#     plt.ylabel("Successful collections in the hour")
+#     plt.title(
+#         f"Hourly result distribution; {N_SIMULATIONS} simulations per hour"
+#     )
+#     plt.xticks(rotation=55, ha="right")
+#     plt.tight_layout()
+#     plt.savefig(output_path, dpi=160)
+#     plt.close()
+
+
+# def plot_expected_vs_actual(
+#     daily_df: pd.DataFrame,
+#     output_path: Path,
+# ) -> None:
+#     summary = (
+#         daily_df
+#         .groupby("policy")
+#         .agg(
+#             actual=("collected_clients", "mean"),
+#             expected=("expected_collected_clients", "mean"),
+#         )
+#         .reindex(POLICY_ORDER)
+#     )
+
+#     x = np.arange(len(summary))
+#     width = 0.38
+
+#     plt.figure(figsize=(11, 6))
+#     plt.bar(
+#         x - width / 2,
+#         summary["actual"],
+#         width=width,
+#         label="Actual Monte-Carlo mean",
+#     )
+#     plt.bar(
+#         x + width / 2,
+#         summary["expected"],
+#         width=width,
+#         label="Expected value",
+#     )
+#     plt.xticks(x, summary.index, rotation=25, ha="right")
+#     plt.ylabel("Collections per day")
+#     plt.title("Expected vs actual mean result")
+#     plt.legend()
+#     plt.tight_layout()
+#     plt.savefig(output_path, dpi=160)
+#     plt.close()
+
+def plot_mean_result(
+        daily_df: pd.DataFrame,
+        output_path: Path,
+        ) -> None:
+    
+    means = (
+        daily_df
+        .groupby("policy")["collected_clients"]
+        .mean()
+        .reindex(POLICY_ORDER)
+        )
+    
+    plt.figure(figsize=(9, 6))
+    
+    plt.bar(means.index, means.values)
+    plt.ylabel("Среднее число успешных взысканий за день")
+    plt.title("Средний результат алгоритмов")
+    plt.xticks(rotation=25, ha='right')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    
+    plt.close()
+    
+def plot_hourly_mean(
+        hourly_df: pd.DataFrame,
+        output_path: Path,
+        ) -> None:
+    
+    hourly_mean = (
+        hourly_df
+        .groupby(
+            ["policy", "hour"]
+            )["collected_clients"]
+        .mean()
+        .reset_index()
+        )
+    plt.figure(figsize=(10,6))
+    
+    for policy in POLICY_ORDER:
+        data = hourly_mean[
+            hourly_mean["policy"] == policy
+            ]
+        plt.plot(data['hour'], data['collected_clients'], marker='o', label=policy)
+        
+    plt.xlabel("Час")
+    plt.ylabel("Среднее число взысканий за час")
+    plt.title("Средний результат по часам")
+    plt.xticks(HOURS)
+    plt.legend()
+    plt.tight_layout()
+    
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+    
+
+def make_distribution_table(
+        daily_df: pd.DataFrame
+        ) -> pd.DataFrame:
+    table = pd.crosstab(daily_df['policy'], daily_df['collected_clients'], normalize='index') * 100
+    table = (table.reindex(POLICY_ORDER).round(1))
+    
+    table.columns = [f"{col} collections" for col in table.columns]
+    
+    return table
+
+def validate_results(
+    calls_df: pd.DataFrame,
+    hourly_df: pd.DataFrame,
+) -> None:
+    """
+    Basic structural checks.
+    """
+    # Exactly four calls per policy per hour per simulation.
+    if not (hourly_df["attempts"] == N_AGENTS).all():
+        raise AssertionError("Not every policy uses all 4 agents every hour.")
+
+    # At most one call to each client within simulation-policy.
+    max_calls = (
+        calls_df
+        .groupby(["simulation", "policy", "client"])
+        .size()
+        .max()
+    )
+    if max_calls > 1:
+        raise AssertionError("A client was called more than once in a day.")
+
+    # Exactly 16 total calls per policy-day.
+    daily_attempts = (
+        calls_df
+        .groupby(["simulation", "policy"])
+        .size()
+    )
+    if not (daily_attempts == N_AGENTS * N_HOURS).all():
+        raise AssertionError("Policy-day does not have exactly 16 calls.")
+
+
+#%%
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+calls_df, hourly_df, daily_df = run_experiment()
+validate_results(calls_df, hourly_df)
+
+summary_df = make_summary(daily_df)
+#hourly_summary_df = make_hourly_summary(hourly_df)
+distribution_df = make_distribution_table(daily_df)
+
+print("\n=== SUMMARY ===")
+print(summary_df.round(2).to_string(index=False))
+
+print("\n=== DAILY RESULT DISTRIBUTION, % ===")
+print(distribution_df.to_string())
+
+# Save data.
+calls_df.to_csv(
+    OUTPUT_DIR / "calls.csv",
+    index=False,
+)
+hourly_df.to_csv(
+    OUTPUT_DIR / "hourly_results.csv",
+    index=False,
+)
+daily_df.to_csv(
+    OUTPUT_DIR / "daily_results.csv",
+    index=False,
+)
+summary_df.to_csv(
+    OUTPUT_DIR / "summary.csv",
+    index=False,
+)
+distribution_df.to_csv(
+    OUTPUT_DIR / "distribution_df.csv",
+    index=False,
+)
+
+# Save the fixed response-probability matrix separately.
+# rng_for_static_data = np.random.default_rng(SEED)
+# p_response = make_response_probabilities(rng_for_static_data)
+# p_df = pd.DataFrame(
+#     p_response,
+#     columns=[f"{h}:00" for h in HOURS],
+# )
+# p_df.insert(
+#     0,
+#     "client",
+#     np.arange(1, N_CLIENTS + 1),
+# )
+# p_df.to_csv(
+#     OUTPUT_DIR / "response_probabilities.csv",
+#     index=False,
+# )
+
+# Plots.
+plot_daily_distribution(
+    daily_df,
+    OUTPUT_DIR / "daily_distribution.png",
+)
+# plot_hourly_distribution(
+#     hourly_df,
+#     OUTPUT_DIR / "hourly_distribution.png",
+# )
+# plot_expected_vs_actual(
+#     daily_df,
+#     OUTPUT_DIR / "expected_vs_actual.png",
+# )
+
+plot_mean_result(
+    daily_df,
+    OUTPUT_DIR / "mean_result.png",
+)
+
+plot_hourly_mean(
+    hourly_df,
+    OUTPUT_DIR / "hourly_mean.png",
+)
+
+# print("\n=== DAILY SUMMARY ===")
+# print(
+#     summary_df.round(3).to_string(index=False)
+# )
+
+# print("\n=== HOURLY MEAN ACTUAL COLLECTIONS ===")
+# hourly_pivot = (
+#     hourly_summary_df
+#     .pivot(
+#         index="hour",
+#         columns="policy",
+#         values="mean_actual_clients",
+#     )
+#     .reindex(columns=POLICY_ORDER)
+# )
+# print(hourly_pivot.round(3).to_string())
+
+# print("\n=== RESPONSE PROBABILITIES, CLIENT 1 ===")
+# print(
+#     p_df.loc[p_df["client"] == 1]
+#     .round(3)
+#     .to_string(index=False)
+# )
+
+print(f"\nFiles saved to: {OUTPUT_DIR.resolve()}")
+
+#%%
+
+daily_df.loc[:, 
+    ["collected_clients", "policy"]
+].groupby(['policy', 'collected_clients']).agg('collected_clients').count()
+
+#%%
+
+
+#%%
